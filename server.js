@@ -122,6 +122,9 @@ app.get('/confirm', async (req, res) => {
       { auth: { username: SIFALO_USERNAME, password: SIFALO_API_KEY } }
     );
 
+    // TEMP DEBUG — remove after we confirm the phone number field name
+    console.log('Sifalo verify response:', JSON.stringify(data));
+
     if (data.status === 'success' && productInfo) {
       // Fire Purchase to Meta — exactly once, tied to this specific order
       try {
