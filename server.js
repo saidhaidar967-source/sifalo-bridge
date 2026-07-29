@@ -122,12 +122,24 @@ app.get('/confirm', async (req, res) => {
       { auth: { username: SIFALO_USERNAME, password: SIFALO_API_KEY } }
     );
 
-    // TEMP DEBUG — remove after we confirm the phone number field name
-    console.log('Sifalo verify response:', JSON.stringify(data));
-
     if (data.status === 'success' && productInfo) {
       // Fire Purchase to Meta — exactly once, tied to this specific order
       try {
+        // Sifalo returns the payer's phone in `account`, already in international
+        // format (e.g. 252613687974). Meta requires customer identifiers to be
+        // SHA-256 hashed — never send raw phone/email.
+        const userData = {
+          client_ip_address: req.ip,
+          client_user_agent: req.headers['user-agent']
+        };
+
+        if (data.account) {
+          const normalizedPhone = String(data.account).replace(/\D/g, ''); // digits only
+          userData.ph = [
+            crypto.createHash('sha256').update(normalizedPhone).digest('hex')
+          ];
+        }
+
         await axios.post(
           `https://graph.facebook.com/v19.0/${FB_PIXEL_ID}/events?access_token=${FB_ACCESS_TOKEN}`,
           {
@@ -138,10 +150,7 @@ app.get('/confirm', async (req, res) => {
                 event_id: order_id || sid,
                 action_source: 'website',
                 event_source_url: `${BASE_URL}/confirm`,
-                user_data: {
-                  client_ip_address: req.ip,
-                  client_user_agent: req.headers['user-agent']
-                },
+                user_data: userData,
                 custom_data: {
                   currency: 'USD',
                   value: parseFloat(productInfo.price),
