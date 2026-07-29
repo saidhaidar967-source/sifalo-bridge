@@ -2,42 +2,34 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
-
 const app = express();
-
 const {
   SIFALO_USERNAME,
   SIFALO_API_KEY,
+  FB_PIXEL_ID,
+  FB_ACCESS_TOKEN,
   BASE_URL,
   PORT = 3000
 } = process.env;
 
 // ── Add every product you sell here ──────────────────────────────
-// price is in USD (Sifalo only supports USD right now)
-// downloadUrl is the exact Systeme.io page the customer lands on after paying
 const PRODUCTS = {
   book: {
     name: 'Dalbo Buugga',
     price: '4.99',
     downloadUrl: 'https://www.raadeeyenets01.co/0ce6826c'
   }
-  // dalbo: { name: 'Dalbo', price: '9.99', downloadUrl: 'https://...' }
 };
 // ──────────────────────────────────────────────────────────────────
 
-// Step 1: customer clicks "Buy Now" → this creates the Sifalo payment
-// and sends them to the Sifalo checkout page
 app.get('/buy', async (req, res) => {
   const productId = req.query.product;
   const product = PRODUCTS[productId];
-
   if (!product) {
     return res.status(404).send('Unknown product.');
   }
-
   const orderId = crypto.randomBytes(8).toString('hex');
   const returnUrl = `${BASE_URL}/confirm?order_id=${orderId}&product=${productId}`;
-
   try {
     const { data } = await axios.post(
       'https://api.sifalopay.com/gateway/',
@@ -49,7 +41,6 @@ app.get('/buy', async (req, res) => {
       },
       { auth: { username: SIFALO_USERNAME, password: SIFALO_API_KEY } }
     );
-
     const { key, token } = data;
     res.redirect(
       `https://pay.sifalo.com/checkout/?key=${encodeURIComponent(key)}&token=${encodeURIComponent(token)}`
@@ -60,10 +51,8 @@ app.get('/buy', async (req, res) => {
   }
 });
 
-// Step 2: Sifalo sends the customer back here after they pay (or cancel)
-// We verify the transaction, then send them to the real download page
 app.get('/confirm', async (req, res) => {
-  const { sid, product } = req.query;
+  const { sid, product, order_id } = req.query;
   const productInfo = PRODUCTS[product];
 
   if (!sid) {
@@ -78,6 +67,36 @@ app.get('/confirm', async (req, res) => {
     );
 
     if (data.status === 'success' && productInfo) {
+      // Fire Purchase to Meta — exactly once, tied to this specific order
+      try {
+        await axios.post(
+          `https://graph.facebook.com/v19.0/${FB_PIXEL_ID}/events?access_token=${FB_ACCESS_TOKEN}`,
+          {
+            data: [
+              {
+                event_name: 'Purchase',
+                event_time: Math.floor(Date.now() / 1000),
+                event_id: order_id || sid,
+                action_source: 'website',
+                event_source_url: productInfo.downloadUrl,
+                user_data: {
+                  client_ip_address: req.ip,
+                  client_user_agent: req.headers['user-agent']
+                },
+                custom_data: {
+                  currency: 'USD',
+                  value: parseFloat(productInfo.price),
+                  content_name: productInfo.name,
+                  order_id: order_id || sid
+                }
+              }
+            ]
+          }
+        );
+      } catch (metaErr) {
+        console.error('Meta CAPI failed:', metaErr.response?.data || metaErr.message);
+      }
+
       return res.redirect(productInfo.downloadUrl);
     }
 
@@ -89,5 +108,4 @@ app.get('/confirm', async (req, res) => {
 });
 
 app.get('/', (req, res) => res.send('Sifalo Pay bridge is running.'));
-
 app.listen(PORT, () => console.log(`Sifalo bridge running on port ${PORT}`));
