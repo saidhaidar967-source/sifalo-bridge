@@ -74,18 +74,6 @@ async function kvGetToken(token) {
   }
 }
 
-async function kvDeleteToken(token) {
-  try {
-    await axios.delete(
-      `${KV_BASE}/values/${encodeURIComponent(token)}`,
-      { headers: { Authorization: `Bearer ${CF_API_TOKEN}` } }
-    );
-  } catch (err) {
-    // Not fatal — if delete fails, the token still expires naturally via TTL.
-    console.error('KV token delete failed:', err.response?.data || err.message);
-  }
-}
-
 // ── /buy — start Sifalo checkout (unchanged) ─────────────────────
 app.get('/buy', async (req, res) => {
   const productId = req.query.product;
@@ -178,14 +166,19 @@ app.get('/confirm', async (req, res) => {
         console.error('Meta CAPI failed:', metaErr.response?.data || metaErr.message);
       }
 
-      // Generate a temporary download token, valid 30 minutes, reusable within that window
+      // Generate a temporary download token, valid 30 minutes, allows a
+      // small number of uses (not just 1) — mobile networks drop mid-download
+      // often, and browsers sometimes silently prefetch links in the
+      // background, so a strict single-use token can lock out a real buyer
+      // before they ever see the file. 3 uses is generous for retries but
+      // still shuts the link down quickly if it gets forwarded/shared.
       const token = crypto.randomBytes(24).toString('hex');
       const ttlSeconds = 30 * 60;
 
       try {
         await kvPutToken(
           token,
-          { product, sid, orderId: order_id || sid, createdAt: Date.now() },
+          { product, sid, orderId: order_id || sid, createdAt: Date.now(), usesRemaining: 3 },
           ttlSeconds
         );
       } catch (kvErr) {
@@ -222,6 +215,16 @@ app.get('/download', async (req, res) => {
     return res.status(400).send('Missing download link. Please use the link from your payment confirmation.');
   }
 
+  // Browsers (especially Chrome on Android) sometimes silently pre-fetch
+  // links in the background right after a page loads, guessing the user
+  // will click them. That request would otherwise burn the token before the
+  // real customer ever taps the button. Chrome marks these with a
+  // Purpose/Sec-Purpose header — detect and ignore them completely.
+  const purposeHeader = (req.headers['purpose'] || req.headers['sec-purpose'] || '').toLowerCase();
+  if (purposeHeader.includes('prefetch') || purposeHeader.includes('prerender')) {
+    return res.status(204).end();
+  }
+
   let record;
   try {
     record = await kvGetToken(token);
@@ -230,7 +233,7 @@ app.get('/download', async (req, res) => {
     return res.status(500).send('Something went wrong preparing your download. Please try again shortly.');
   }
 
-  if (!record) {
+  if (!record || !(record.usesRemaining > 0)) {
     return res.status(410).send('This download link has expired or is invalid. Contact support with your payment reference if you still need your book.');
   }
 
@@ -252,12 +255,20 @@ app.get('/download', async (req, res) => {
       res.setHeader('Content-Length', object.ContentLength);
     }
 
-    // Only invalidate the token once the download has genuinely finished —
-    // if the connection drops partway, the token stays valid so the buyer
-    // can retry. Once it completes, this link is dead for anyone (including
-    // the buyer) — protects against the link being shared/forwarded.
+    // Only spend one "use" once the download has genuinely finished — if the
+    // connection drops partway, this attempt doesn't count against the
+    // buyer. After a few completed downloads, the link stops working for
+    // everyone — protects against it being shared/forwarded indefinitely.
     object.Body.on('end', () => {
-      kvDeleteToken(token);
+      const remainingTtl = Math.max(
+        60,
+        Math.floor((record.createdAt + 30 * 60 * 1000 - Date.now()) / 1000)
+      );
+      kvPutToken(
+        token,
+        { ...record, usesRemaining: record.usesRemaining - 1 },
+        remainingTtl
+      ).catch(err => console.error('KV token update failed:', err.response?.data || err.message));
     });
 
     object.Body.pipe(res);
