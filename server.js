@@ -12,6 +12,7 @@ const {
   FB_PIXEL_ID,
   FB_ACCESS_TOKEN,
   BASE_URL,
+  DOWNLOAD_PAGE_URL,
   CF_ACCOUNT_ID,
   CF_API_TOKEN,
   CF_KV_NAMESPACE_ID,
@@ -180,6 +181,17 @@ app.get('/confirm', async (req, res) => {
         return res.status(500).send('Payment confirmed, but we could not prepare your download. Contact support with reference: ' + sid);
       }
 
+      // Send the customer to the Systeme.io "Degso Buuggaaga" thank-you page.
+      // Landing on this real page is what lets Meta Pixel fire client-side too
+      // (using the SAME event_id as the CAPI call above, so Meta deduplicates
+      // and doesn't double-count the sale). The download button on that page
+      // should link to BASE_URL + /download?token=... which is handled below.
+      if (DOWNLOAD_PAGE_URL) {
+        const thankYouUrl = `${DOWNLOAD_PAGE_URL}?token=${token}&order_id=${encodeURIComponent(order_id || sid)}&product=${encodeURIComponent(product)}`;
+        return res.redirect(thankYouUrl);
+      }
+
+      // Fallback if DOWNLOAD_PAGE_URL isn't configured yet
       return res.redirect(`${BASE_URL}/download?token=${token}`);
     }
 
