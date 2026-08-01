@@ -74,6 +74,18 @@ async function kvGetToken(token) {
   }
 }
 
+async function kvDeleteToken(token) {
+  try {
+    await axios.delete(
+      `${KV_BASE}/values/${encodeURIComponent(token)}`,
+      { headers: { Authorization: `Bearer ${CF_API_TOKEN}` } }
+    );
+  } catch (err) {
+    // Not fatal — if delete fails, the token still expires naturally via TTL.
+    console.error('KV token delete failed:', err.response?.data || err.message);
+  }
+}
+
 // ── /buy — start Sifalo checkout (unchanged) ─────────────────────
 app.get('/buy', async (req, res) => {
   const productId = req.query.product;
@@ -239,6 +251,14 @@ app.get('/download', async (req, res) => {
     if (object.ContentLength) {
       res.setHeader('Content-Length', object.ContentLength);
     }
+
+    // Only invalidate the token once the download has genuinely finished —
+    // if the connection drops partway, the token stays valid so the buyer
+    // can retry. Once it completes, this link is dead for anyone (including
+    // the buyer) — protects against the link being shared/forwarded.
+    object.Body.on('end', () => {
+      kvDeleteToken(token);
+    });
 
     object.Body.pipe(res);
   } catch (err) {
