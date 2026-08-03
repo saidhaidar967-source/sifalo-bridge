@@ -28,7 +28,7 @@ const {
 const PRODUCTS = {
   book: {
     name: 'Dalbo Buugga',
-    price: '4.99',
+    price: '5.50',
     r2Key: 'siraha-ganacsi-01.pdf' // file inside the private R2 bucket
   }
 };
