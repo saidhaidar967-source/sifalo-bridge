@@ -16,7 +16,7 @@ const PRODUCTS = {
   book: {
     name: 'Dalbo Buugga',
     price: '5.50',
-    downloadUrl: 'https://www.raadeeyenets01.co/siraha-ganacsi'
+    downloadUrl: 'https://www.raadeeyenets01.co/degso-buuggaaga'
   }
 };
 
