@@ -15,8 +15,13 @@ const {
 const PRODUCTS = {
   book: {
     name: 'Dalbo Buugga',
-    price: '4.99',
+    price: '5.50',
     downloadUrl: 'https://www.raadeeyenets01.co/degso-buuggaaga'
+  },
+  guusha: {
+    name: 'Guusha Ganacsigaaga',
+    price: '3.50',
+    downloadUrl: 'https://www.raadeeyenets01.co/degso'
   }
 };
 
