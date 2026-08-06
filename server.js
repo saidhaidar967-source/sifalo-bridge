@@ -40,7 +40,7 @@ const PRODUCTS = {
   guusha: {
     name: 'Guusha Ganacsigaaga',
     price: '3.50',
-    downloadUrl: 'https://www.raadeeyenets01.co/degso'
+    downloadUrl: 'https://www.raadeeyenets01.co/guusha-ganacsi'
   }
 };
 
