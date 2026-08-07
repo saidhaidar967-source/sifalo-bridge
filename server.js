@@ -171,20 +171,24 @@ app.get('/confirm', async (req, res) => {
         console.error('Meta CAPI failed:', metaErr.response?.data || metaErr.message);
       }
 
-      const token = crypto.randomBytes(24).toString('hex');
+      if (productInfo.r2Key) {
+        const token = crypto.randomBytes(24).toString('hex');
 
-      try {
-        await kvPutToken(
-          token,
-          { product, sid, orderId: order_id || sid, createdAt: Date.now(), usesRemaining: 3 },
-          TOKEN_TTL_SECONDS
-        );
-      } catch (kvErr) {
-        console.error('KV token store failed:', kvErr.response?.data || kvErr.message);
-        return res.status(500).send('Payment confirmed, but we could not prepare your download. Contact support with reference: ' + sid);
+        try {
+          await kvPutToken(
+            token,
+            { product, sid, orderId: order_id || sid, createdAt: Date.now(), usesRemaining: 3 },
+            TOKEN_TTL_SECONDS
+          );
+        } catch (kvErr) {
+          console.error('KV token store failed:', kvErr.response?.data || kvErr.message);
+          return res.status(500).send('Payment confirmed, but we could not prepare your download. Contact support with reference: ' + sid);
+        }
+
+        return res.redirect(`${BASE_URL}/download?token=${token}`);
       }
 
-      return res.redirect(`${BASE_URL}/download?token=${token}`);
+      return res.redirect(productInfo.downloadUrl);
     }
 
     res.send('Payment was not completed. If you were charged, contact support and share this reference: ' + sid);
