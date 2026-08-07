@@ -35,7 +35,7 @@ const PRODUCTS = {
   book: {
     name: 'Dalbo Buugga',
     price: '4.99',
-    downloadUrl: 'https://www.raadeeyenets01.co/degso-buuggaaga'
+    r2Key: 'siraha-ganacsi-01.pdf'
   },
   guusha: {
     name: 'Guusha Ganacsigaaga',
