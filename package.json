@@ -1,15 +1,16 @@
 {
   "name": "sifalo-bridge",
   "version": "1.0.0",
-  "description": "Bridges Systeme.io product pages to Sifalo Pay checkout and back to the download page",
+  "description": "Bridges Systeme.io product pages to Sifalo Pay checkout and back",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-"@aws-sdk/client-s3": "^3.600.0",
-"express": "^4.19.2",
-"axios": "^1.7.2",
-"cors": "^2.8.5",
-"dotenv": "^16.4.5"
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.600.0",
+    "express": "^4.19.2",
+    "axios": "^1.7.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5"
   }
 }
