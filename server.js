@@ -35,7 +35,7 @@ const TOKEN_TTL_SECONDS = TOKEN_TTL_MINUTES * 60;
 const PRODUCTS = {
   book: {
     name: 'Dalbo Buugga',
-    price: '1',
+    price: '4.99',
     r2Key: 'siraha-ganacsi-01.pdf'
   },
   guusha: {
