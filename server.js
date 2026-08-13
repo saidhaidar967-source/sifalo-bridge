@@ -201,6 +201,13 @@ app.get('/confirm', async (req, res) => {
 
 // /download — shows a small page that starts the file download automatically,
 // then redirects to the thank-you/upsell page a few seconds later.
+//
+// CHANGED: uses a hidden <a download> click instead of a hidden <iframe>.
+// On mobile Chrome, an iframe streaming a Content-Disposition: attachment
+// response can hijack the whole tab into the native "Download complete"
+// screen, which kills the page's JS context before the redirect timer
+// fires. A programmatic anchor click with the `download` attribute is
+// treated as a background download and doesn't take over the tab.
 app.get('/download', async (req, res) => {
   const { token } = req.query;
 
@@ -228,11 +235,31 @@ app.get('/download', async (req, res) => {
       <head><meta charset="utf-8"><title>Your download is starting</title></head>
       <body>
         <p>Your download is starting. If it does not begin automatically, <a id="dl" href="/download/file?token=${token}">click here</a>.</p>
-        <iframe src="/download/file?token=${token}" style="display:none"></iframe>
         <script>
-          setTimeout(function () {
-            window.location.href = '${THANK_YOU_URL}';
-          }, 4000);
+          (function () {
+            var redirected = false;
+
+            function goToThankYou() {
+              if (redirected) return;
+              redirected = true;
+              window.location.href = '${THANK_YOU_URL}';
+            }
+
+            var a = document.createElement('a');
+            a.href = '/download/file?token=${token}';
+            a.download = '';
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+
+            setTimeout(goToThankYou, 4000);
+
+            document.addEventListener('visibilitychange', function () {
+              if (document.visibilityState === 'visible') {
+                goToThankYou();
+              }
+            });
+          })();
         </script>
       </body>
     </html>
