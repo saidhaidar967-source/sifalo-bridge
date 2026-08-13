@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 
 const app = express();
-
+app.use(express.json());
 const {
   SIFALO_USERNAME,
   SIFALO_API_KEY,
@@ -301,7 +301,149 @@ app.get('/download/file', async (req, res) => {
     res.status(500).send('Could not retrieve your file. Contact support with your payment reference.');
   }
 });
+// ============================================================
+// DIRECT E-WALLET PAYMENT ROUTE (Doc 1 style — no Sifalo redirect)
+// Add this to server.js alongside your existing /buy and /confirm routes.
+// Requires: app.use(express.json()) enabled globally or on this route.
+// ============================================================
 
+// Map your UI's method labels to Sifalo's gateway values.
+const GATEWAY_MAP = {
+  evc: 'waafi',
+  zaad: 'waafi',
+  sahal: 'waafi',
+  edahab: 'edahab',
+  premier: 'pbwallet'
+};
+
+// /pay — charge directly, no redirect to pay.sifalo.com.
+// The customer approves via USSD PIN prompt on their own phone; this
+// request is expected to hold open until Sifalo has a final result
+// (or times out), based on what you've seen with xikmabooks' flow.
+// CONFIRM THIS ASSUMPTION IN TESTING — see TESTING.md.
+app.post('/pay', async (req, res) => {
+  const { product, phone, method } = req.body || {};
+  const productInfo = PRODUCTS[product];
+  const gateway = GATEWAY_MAP[method];
+
+  if (!productInfo) {
+    return res.status(404).json({ error: 'Unknown product.' });
+  }
+  if (!phone || !/^\d{7,15}$/.test(String(phone).replace(/\s+/g, ''))) {
+    return res.status(400).json({ error: 'Enter a valid phone number.' });
+  }
+  if (!gateway) {
+    return res.status(400).json({ error: 'Choose a payment method.' });
+  }
+
+  const orderId = crypto.randomBytes(8).toString('hex');
+  const normalizedPhone = String(phone).replace(/\D/g, '');
+
+  let sifaloData;
+  try {
+    const { data } = await axios.post(
+      'https://api.sifalopay.com/gateway/',
+      {
+        account: normalizedPhone,
+        gateway,
+        amount: productInfo.price,
+        currency: 'USD',
+        order_id: orderId
+      },
+      {
+        auth: { username: SIFALO_USERNAME, password: SIFALO_API_KEY },
+        // USSD approval may take a while — give it room before Axios times out.
+        // Tune this once you see real response times in testing.
+        timeout: 45000
+      }
+    );
+    sifaloData = data;
+  } catch (err) {
+    console.error('Direct payment request failed:', err.response?.data || err.message);
+    return res.status(502).json({ error: 'Could not reach payment provider. Please try again.' });
+  }
+
+  const { code, sid, response } = sifaloData;
+
+  // 601 — success. Do the same post-purchase work /confirm does today:
+  // Meta CAPI + R2 token mint, but with data we already have (no verify.php round trip needed).
+  if (code === '601' || code === 601) {
+    try {
+      const userData = {
+        client_ip_address: req.ip,
+        client_user_agent: req.headers['user-agent'],
+        ph: [crypto.createHash('sha256').update(normalizedPhone).digest('hex')]
+      };
+
+      await axios.post(
+        `https://graph.facebook.com/v19.0/${FB_PIXEL_ID}/events?access_token=${FB_ACCESS_TOKEN}`,
+        {
+          data: [{
+            event_name: 'Purchase',
+            event_time: Math.floor(Date.now() / 1000),
+            event_id: orderId,
+            action_source: 'website',
+            event_source_url: `${BASE_URL}/pay`,
+            user_data: userData,
+            custom_data: {
+              currency: 'USD',
+              value: parseFloat(productInfo.price),
+              content_name: productInfo.name,
+              order_id: orderId
+            }
+          }]
+        }
+      ).catch(metaErr => console.error('Meta CAPI failed:', metaErr.response?.data || metaErr.message));
+
+      if (productInfo.r2Key) {
+        const token = crypto.randomBytes(24).toString('hex');
+        await kvPutToken(
+          token,
+          { product, sid, orderId, createdAt: Date.now(), usesRemaining: 3 },
+          TOKEN_TTL_SECONDS
+        );
+        return res.json({ status: 'success', downloadUrl: `/download?token=${token}` });
+      }
+
+      return res.json({ status: 'success', downloadUrl: productInfo.downloadUrl });
+    } catch (err) {
+      console.error('Post-payment processing failed:', err.response?.data || err.message);
+      return res.status(500).json({
+        status: 'success_no_download',
+        error: 'Payment succeeded but we could not prepare your download. Contact support with reference: ' + sid
+      });
+    }
+  }
+
+  // 603 — pending. Return this as-is; frontend should poll /pay-status?sid=... (below)
+  // ONLY if testing shows the initial request returns before final resolution.
+  if (code === '603' || code === 603) {
+    return res.json({ status: 'pending', sid, message: response });
+  }
+
+  // 604 / 600 — insufficient funds / failed.
+  return res.status(402).json({ status: 'failed', code, message: response });
+});
+
+// /pay-status — polling fallback, only needed if 603 turns out to be common
+// and doesn't resolve within the original request. Delete this if testing
+// shows /pay already blocks until final status.
+app.get('/pay-status', async (req, res) => {
+  const { sid } = req.query;
+  if (!sid) return res.status(400).json({ error: 'Missing sid.' });
+
+  try {
+    const { data } = await axios.post(
+      'https://api.sifalopay.com/gateway/verify.php',
+      { sid },
+      { auth: { username: SIFALO_USERNAME, password: SIFALO_API_KEY } }
+    );
+    res.json(data);
+  } catch (err) {
+    console.error('Status check failed:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Could not check status.' });
+  }
+});
 app.get('/', (req, res) => res.send('Sifalo Pay bridge is running.'));
 
 app.listen(PORT, () => console.log(`Sifalo bridge running on port ${PORT}`));
