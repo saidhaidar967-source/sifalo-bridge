@@ -3,9 +3,10 @@ const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
-
+const cors = require('cors');
 const app = express();
 app.use(express.json());
+app.use(cors());
 const {
   SIFALO_USERNAME,
   SIFALO_API_KEY,
