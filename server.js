@@ -35,7 +35,7 @@ const TOKEN_TTL_SECONDS = TOKEN_TTL_MINUTES * 60;
 const PRODUCTS = {
   book: {
     name: 'Dalbo Buugga',
-    price: '4.99',
+    price: '1',
     r2Key: 'siraha-ganacsi-01.pdf'
   },
   guusha: {
@@ -410,7 +410,7 @@ const GATEWAY_MAP = {
 // (or times out), based on what you've seen with xikmabooks' flow.
 // CONFIRM THIS ASSUMPTION IN TESTING — see TESTING.md.
 app.post('/pay', async (req, res) => {
-  const { product, phone, method } = req.body || {};
+  const { product, phone, method, fbp, fbc } = req.body || {};
   const productInfo = PRODUCTS[product];
   const gateway = GATEWAY_MAP[method];
 
@@ -462,6 +462,10 @@ app.post('/pay', async (req, res) => {
         client_user_agent: req.headers['user-agent'],
         ph: [crypto.createHash('sha256').update(normalizedPhone).digest('hex')]
       };
+      // Bridges the browser pixel to this server-side event so Meta can
+      // attribute the purchase back to the ad click that led here.
+      if (fbp) userData.fbp = fbp;
+      if (fbc) userData.fbc = fbc;
 
       await axios.post(
         `https://graph.facebook.com/v19.0/${FB_PIXEL_ID}/events?access_token=${FB_ACCESS_TOKEN}`,
@@ -517,7 +521,7 @@ app.post('/pay', async (req, res) => {
 // and doesn't resolve within the original request. Delete this if testing
 // shows /pay already blocks until final status.
 app.get('/pay-status', async (req, res) => {
-  const { sid, product } = req.query;
+  const { sid, product, fbp, fbc } = req.query;
   if (!sid) return res.status(400).json({ error: 'Missing sid.' });
 
   let data;
@@ -554,6 +558,8 @@ app.get('/pay-status', async (req, res) => {
     if (normalizedPhone) {
       userData.ph = [crypto.createHash('sha256').update(normalizedPhone).digest('hex')];
     }
+    if (fbp) userData.fbp = fbp;
+    if (fbc) userData.fbc = fbc;
 
     await axios.post(
       `https://graph.facebook.com/v19.0/${FB_PIXEL_ID}/events?access_token=${FB_ACCESS_TOKEN}`,
