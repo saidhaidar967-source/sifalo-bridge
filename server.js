@@ -35,7 +35,7 @@ const TOKEN_TTL_SECONDS = TOKEN_TTL_MINUTES * 60;
 const PRODUCTS = {
   book: {
     name: 'Dalbo Buugga',
-    price: '4.99',
+    price: '1',
     r2Key: 'siraha-ganacsi-01.pdf'
   },
   guusha: {
@@ -231,13 +231,79 @@ app.get('/download', async (req, res) => {
   res.setHeader('Content-Type', 'text/html');
   res.send(`
     <!DOCTYPE html>
-    <html>
-      <head><meta charset="utf-8"><title>Your download is starting</title></head>
+    <html lang="so">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Buuggaaga</title>
+        <style>
+          body {
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #f9fafb;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            padding: 24px;
+          }
+          .card {
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 16px;
+            padding: 40px 32px;
+            max-width: 420px;
+            width: 100%;
+            text-align: center;
+            box-sizing: border-box;
+          }
+          .icon {
+            width: 56px;
+            height: 56px;
+            background: #dcfce7;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 20px;
+            font-size: 28px;
+          }
+          h1 {
+            font-size: 19px;
+            margin: 0 0 8px;
+            color: #111827;
+          }
+          p.sub {
+            color: #6b7280;
+            font-size: 14px;
+            margin: 0 0 28px;
+            line-height: 1.5;
+          }
+          .dl-btn {
+            display: block;
+            width: 100%;
+            padding: 16px;
+            background: #2563eb;
+            color: #fff;
+            text-decoration: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 700;
+            box-sizing: border-box;
+          }
+        </style>
+      </head>
       <body>
-        <p>Your download is starting. If it does not begin automatically, <a id="dl" href="/download/file?token=${token}">click here</a>.</p>
+        <div class="card">
+          <div class="icon">✅</div>
+          <h1>Lacagtaadu waa la xaqiijiyay</h1>
+          <p class="sub">Buuggaagu waa diyaar hadda. Riix badhanka hoose si aad u degtid.</p>
+          <a id="dl" href="/download/file?token=${token}" download class="dl-btn">⬇ Dego Buugga</a>
+        </div>
         <script>
           (function () {
             var redirected = false;
+            var dl = document.getElementById('dl');
 
             function goToThankYou() {
               if (redirected) return;
@@ -245,19 +311,13 @@ app.get('/download', async (req, res) => {
               window.location.href = '${THANK_YOU_URL}';
             }
 
-            var a = document.createElement('a');
-            a.href = '/download/file?token=${token}';
-            a.download = '';
-            a.style.display = 'none';
-            document.body.appendChild(a);
-            a.click();
-
-            setTimeout(goToThankYou, 4000);
-
-            document.addEventListener('visibilitychange', function () {
-              if (document.visibilityState === 'visible') {
-                goToThankYou();
-              }
+            // No auto-triggered download here — the button above is a real
+            // link, so clicking it is a genuine user gesture the browser
+            // always honors, instead of a scripted click that Chrome/Safari
+            // can silently block. We just give the download a brief moment
+            // to actually start before moving on.
+            dl.addEventListener('click', function () {
+              setTimeout(goToThankYou, 600);
             });
           })();
         </script>
