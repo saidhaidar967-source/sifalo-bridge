@@ -35,7 +35,7 @@ const TOKEN_TTL_SECONDS = TOKEN_TTL_MINUTES * 60;
 const PRODUCTS = {
   book: {
     name: 'Dalbo Buugga',
-    price: '4.99',
+    price: '1',
     r2Key: 'siraha-ganacsi-01.pdf'
   },
   guusha: {
@@ -457,19 +457,81 @@ app.post('/pay', async (req, res) => {
 // and doesn't resolve within the original request. Delete this if testing
 // shows /pay already blocks until final status.
 app.get('/pay-status', async (req, res) => {
-  const { sid } = req.query;
+  const { sid, product } = req.query;
   if (!sid) return res.status(400).json({ error: 'Missing sid.' });
 
+  let data;
   try {
-    const { data } = await axios.post(
+    const result = await axios.post(
       'https://api.sifalopay.com/gateway/verify.php',
       { sid },
       { auth: { username: SIFALO_USERNAME, password: SIFALO_API_KEY } }
     );
-    res.json(data);
+    data = result.data;
   } catch (err) {
     console.error('Status check failed:', err.response?.data || err.message);
-    res.status(500).json({ error: 'Could not check status.' });
+    return res.status(500).json({ error: 'Could not check status.' });
+  }
+
+  // Still pending or failed — just relay Sifalo's status, nothing to complete yet.
+  if (data.status !== 'success') {
+    return res.json({ status: data.status, code: data.code, message: data.response });
+  }
+
+  // Resolved to success on a delayed check — do the same completion work
+  // /pay does on an immediate 601: Meta Purchase event + R2 download token.
+  const productInfo = PRODUCTS[product];
+  if (!productInfo) {
+    return res.json({ status: 'success_no_download', sid, error: 'Missing product reference for this order.' });
+  }
+
+  try {
+    const normalizedPhone = data.account ? String(data.account).replace(/\D/g, '') : '';
+    const userData = {
+      client_ip_address: req.ip,
+      client_user_agent: req.headers['user-agent']
+    };
+    if (normalizedPhone) {
+      userData.ph = [crypto.createHash('sha256').update(normalizedPhone).digest('hex')];
+    }
+
+    await axios.post(
+      `https://graph.facebook.com/v19.0/${FB_PIXEL_ID}/events?access_token=${FB_ACCESS_TOKEN}`,
+      {
+        data: [{
+          event_name: 'Purchase',
+          event_time: Math.floor(Date.now() / 1000),
+          event_id: sid,
+          action_source: 'website',
+          event_source_url: `${BASE_URL}/pay-status`,
+          user_data: userData,
+          custom_data: {
+            currency: 'USD',
+            value: parseFloat(productInfo.price),
+            content_name: productInfo.name,
+            order_id: sid
+          }
+        }]
+      }
+    ).catch(metaErr => console.error('Meta CAPI failed (pay-status):', metaErr.response?.data || metaErr.message));
+
+    if (productInfo.r2Key) {
+      const token = crypto.randomBytes(24).toString('hex');
+      await kvPutToken(
+        token,
+        { product, sid, orderId: sid, createdAt: Date.now(), usesRemaining: 3 },
+        TOKEN_TTL_SECONDS
+      );
+      return res.json({ status: 'success', downloadUrl: `/download?token=${token}` });
+    }
+
+    return res.json({ status: 'success', downloadUrl: productInfo.downloadUrl });
+  } catch (err) {
+    console.error('Post-payment processing failed (pay-status):', err.response?.data || err.message);
+    return res.status(500).json({
+      status: 'success_no_download',
+      error: 'Payment succeeded but we could not prepare your download. Contact support with reference: ' + sid
+    });
   }
 });
 app.get('/', (req, res) => res.send('Sifalo Pay bridge is running.'));
