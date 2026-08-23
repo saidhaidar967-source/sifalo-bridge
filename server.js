@@ -35,7 +35,7 @@ const TOKEN_TTL_SECONDS = TOKEN_TTL_MINUTES * 60;
 const PRODUCTS = {
   book: {
     name: 'Dalbo Buugga',
-    price: '4.99',
+    price: '1',
     r2Key: 'siraha-ganacsi-01.pdf'
   },
   guusha: {
@@ -197,133 +197,6 @@ app.get('/confirm', async (req, res) => {
     console.error('Verify failed:', err.response?.data || err.message);
     res.status(500).send('Could not verify your payment. Contact support with reference: ' + sid);
   }
-});
-
-// /download — shows a small page that starts the file download automatically,
-// then redirects to the thank-you/upsell page a few seconds later.
-//
-// CHANGED: uses a hidden <a download> click instead of a hidden <iframe>.
-// On mobile Chrome, an iframe streaming a Content-Disposition: attachment
-// response can hijack the whole tab into the native "Download complete"
-// screen, which kills the page's JS context before the redirect timer
-// fires. A programmatic anchor click with the `download` attribute is
-// treated as a background download and doesn't take over the tab.
-app.get('/download', async (req, res) => {
-  const { token } = req.query;
-
-  if (!token) {
-    return res.status(400).send('Missing download link. Please use the link from your payment confirmation.');
-  }
-
-  const record = await kvGetToken(token).catch(err => {
-    console.error('KV token lookup failed:', err.response?.data || err.message);
-    return undefined;
-  });
-
-  if (record === undefined) {
-    return res.status(500).send('Something went wrong preparing your download. Please try again shortly.');
-  }
-
-  if (!record || !(record.usesRemaining > 0)) {
-    return res.status(410).send('This download link has expired or is invalid. Contact support with your payment reference if you still need your book.');
-  }
-
-  res.setHeader('Content-Type', 'text/html');
-  res.send(`
-    <!DOCTYPE html>
-    <html lang="so">
-      <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Buuggaaga</title>
-        <style>
-          body {
-            margin: 0;
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: #f9fafb;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            padding: 24px;
-          }
-          .card {
-            background: #fff;
-            border: 1px solid #e5e7eb;
-            border-radius: 16px;
-            padding: 40px 32px;
-            max-width: 420px;
-            width: 100%;
-            text-align: center;
-            box-sizing: border-box;
-          }
-          .icon {
-            width: 56px;
-            height: 56px;
-            background: #dcfce7;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin: 0 auto 20px;
-            font-size: 28px;
-          }
-          h1 {
-            font-size: 19px;
-            margin: 0 0 8px;
-            color: #111827;
-          }
-          p.sub {
-            color: #6b7280;
-            font-size: 14px;
-            margin: 0 0 28px;
-            line-height: 1.5;
-          }
-          .dl-btn {
-            display: block;
-            width: 100%;
-            padding: 16px;
-            background: #2563eb;
-            color: #fff;
-            text-decoration: none;
-            border-radius: 10px;
-            font-size: 16px;
-            font-weight: 700;
-            box-sizing: border-box;
-          }
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <div class="icon">✅</div>
-          <h1>Lacagtaadu waa la xaqiijiyay</h1>
-          <p class="sub">Buuggaagu waa diyaar hadda. Riix badhanka hoose si aad u degtid.</p>
-          <a id="dl" href="/download/file?token=${token}" download class="dl-btn">⬇ Dego Buugga</a>
-        </div>
-        <script>
-          (function () {
-            var redirected = false;
-            var dl = document.getElementById('dl');
-
-            function goToThankYou() {
-              if (redirected) return;
-              redirected = true;
-              window.location.href = '${THANK_YOU_URL}';
-            }
-
-            // No auto-triggered download here — the button above is a real
-            // link, so clicking it is a genuine user gesture the browser
-            // always honors, instead of a scripted click that Chrome/Safari
-            // can silently block. We just give the download a brief moment
-            // to actually start before moving on.
-            dl.addEventListener('click', function () {
-              setTimeout(goToThankYou, 600);
-            });
-          })();
-        </script>
-      </body>
-    </html>
-  `);
 });
 
 // /download/file — validates the token again and streams the PDF straight
@@ -494,7 +367,7 @@ app.post('/pay', async (req, res) => {
           { product, sid, orderId, createdAt: Date.now(), usesRemaining: 3 },
           TOKEN_TTL_SECONDS
         );
-        return res.json({ status: 'success', downloadUrl: `/download?token=${token}` });
+        return res.json({ status: 'success', downloadUrl: `${THANK_YOU_URL}?token=${token}` });
       }
 
       return res.json({ status: 'success', downloadUrl: productInfo.downloadUrl });
@@ -588,7 +461,7 @@ app.get('/pay-status', async (req, res) => {
         { product, sid, orderId: sid, createdAt: Date.now(), usesRemaining: 3 },
         TOKEN_TTL_SECONDS
       );
-      return res.json({ status: 'success', downloadUrl: `/download?token=${token}` });
+      return res.json({ status: 'success', downloadUrl: `${THANK_YOU_URL}?token=${token}` });
     }
 
     return res.json({ status: 'success', downloadUrl: productInfo.downloadUrl });
