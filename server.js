@@ -45,7 +45,7 @@ const PRODUCTS = {
   },
   billow: {
     name: 'Billow Ganacsigaaga',
-    price: '0.5',
+    price: '4.70',
     r2Key: 'billow-ganacsigaaga.pdf',
     thankYouUrl: 'https://www.raadeeyenets01.co/la-deg'
   }
