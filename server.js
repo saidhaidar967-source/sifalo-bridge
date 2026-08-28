@@ -23,25 +23,31 @@ const {
   PORT = 3000
 } = process.env;
 
-// Where the customer lands after their file download starts. This is the
-// Systeme.io thank-you page with the upsell offer on it.
-const THANK_YOU_URL = 'https://www.raadeeyenets01.co/degso-buuggaaga';
-
 // How long a download link stays valid after payment, in minutes.
 const TOKEN_TTL_MINUTES = 10;
 const TOKEN_TTL_SECONDS = TOKEN_TTL_MINUTES * 60;
 
-// Add every product you sell here.
+// Add every product you sell here. Each product with an r2Key needs its
+// own thankYouUrl — the Systeme.io page the customer lands on after
+// paying, where the download-confirmation block reads the ?token= and
+// shows the download button.
 const PRODUCTS = {
   book: {
     name: 'Dalbo Buugga',
     price: '4.99',
-    r2Key: 'siraha-ganacsi-01.pdf'
+    r2Key: 'siraha-ganacsi-01.pdf',
+    thankYouUrl: 'https://www.raadeeyenets01.co/degso-buuggaaga'
   },
   guusha: {
     name: 'Guusha Ganacsigaaga',
     price: '3.50',
     downloadUrl: 'https://www.raadeeyenets01.co/guusha-ganacsi'
+  },
+  billow: {
+    name: 'Billow Ganacsigaaga',
+    price: '4.70',
+    r2Key: 'billow-ganacsigaaga.pdf',
+    thankYouUrl: 'https://www.raadeeyenets01.co/la-deg'
   }
 };
 
@@ -301,6 +307,8 @@ app.post('/pay', async (req, res) => {
   const normalizedPhone = String(phone).replace(/\D/g, '');
 
   let sifaloData;
+  const sifaloCallStart = Date.now();
+  console.log(`[${orderId}] Sending charge request to Sifalo at ${new Date(sifaloCallStart).toISOString()}`);
   try {
     const { data } = await axios.post(
       'https://api.sifalopay.com/gateway/',
@@ -319,7 +327,9 @@ app.post('/pay', async (req, res) => {
       }
     );
     sifaloData = data;
+    console.log(`[${orderId}] Sifalo responded after ${Date.now() - sifaloCallStart}ms — code: ${data.code}`);
   } catch (err) {
+    console.log(`[${orderId}] Sifalo call failed/timed out after ${Date.now() - sifaloCallStart}ms`);
     console.error('Direct payment request failed:', err.response?.data || err.message);
     return res.status(502).json({ error: 'Could not reach payment provider. Please try again.' });
   }
@@ -367,7 +377,7 @@ app.post('/pay', async (req, res) => {
           { product, sid, orderId, createdAt: Date.now(), usesRemaining: 3 },
           TOKEN_TTL_SECONDS
         );
-        return res.json({ status: 'success', downloadUrl: `${THANK_YOU_URL}?token=${token}` });
+        return res.json({ status: 'success', downloadUrl: `${productInfo.thankYouUrl}?token=${token}` });
       }
 
       return res.json({ status: 'success', downloadUrl: productInfo.downloadUrl });
@@ -461,7 +471,7 @@ app.get('/pay-status', async (req, res) => {
         { product, sid, orderId: sid, createdAt: Date.now(), usesRemaining: 3 },
         TOKEN_TTL_SECONDS
       );
-      return res.json({ status: 'success', downloadUrl: `${THANK_YOU_URL}?token=${token}` });
+      return res.json({ status: 'success', downloadUrl: `${productInfo.thankYouUrl}?token=${token}` });
     }
 
     return res.json({ status: 'success', downloadUrl: productInfo.downloadUrl });
