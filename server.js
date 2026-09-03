@@ -41,7 +41,8 @@ const PRODUCTS = {
   guusha: {
     name: 'Guusha Ganacsigaaga',
     price: '3.50',
-    downloadUrl: 'https://www.raadeeyenets01.co/guusha-ganacsi'
+    r2Key: 'Guusha-Ganacsigaaga-0.pdf',
+    thankYouUrl: 'https://www.raadeeyenets01.co/guusha-buug'
   },
   billow: {
     name: 'Billow Ganacsigaaga',
