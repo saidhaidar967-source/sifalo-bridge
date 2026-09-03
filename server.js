@@ -40,7 +40,7 @@ const PRODUCTS = {
   },
   guusha: {
     name: 'Guusha Ganacsigaaga',
-    price: '0.5',
+    price: '3.5',
     r2Key: 'Guusha-Ganacsigaaga-0.pdf',
     thankYouUrl: 'https://www.raadeeyenets01.co/guusha-buug'
   },
