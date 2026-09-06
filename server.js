@@ -375,7 +375,7 @@ app.post('/pay', async (req, res) => {
           { product, sid, orderId, createdAt: Date.now(), usesRemaining: 3 },
           TOKEN_TTL_SECONDS
         );
-        return res.json({ status: 'success', downloadUrl: `${productInfo.thankYouUrl}?token=${token}` });
+       return res.json({ status: 'success', downloadUrl: `${BASE_URL}/download/file?token=${token}` });
       }
 
       return res.json({ status: 'success', downloadUrl: productInfo.downloadUrl });
@@ -469,7 +469,7 @@ app.get('/pay-status', async (req, res) => {
         { product, sid, orderId: sid, createdAt: Date.now(), usesRemaining: 3 },
         TOKEN_TTL_SECONDS
       );
-      return res.json({ status: 'success', downloadUrl: `${productInfo.thankYouUrl}?token=${token}` });
+     return res.json({ status: 'success', downloadUrl: `${BASE_URL}/download/file?token=${token}` });
     }
 
     return res.json({ status: 'success', downloadUrl: productInfo.downloadUrl });
