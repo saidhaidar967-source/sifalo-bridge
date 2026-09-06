@@ -34,13 +34,13 @@ const TOKEN_TTL_SECONDS = TOKEN_TTL_MINUTES * 60;
 const PRODUCTS = {
   book: {
     name: 'Dalbo Buugga',
-    price: '0.5',
+    price: '4.99',
     r2Key: 'siraha-ganacsi-01.pdf',
     thankYouUrl: 'https://www.raadeeyenets01.co/degso-buuggaaga'
   },
   guusha: {
     name: 'Guusha Ganacsigaaga',
-    price: '0.5',
+    price: '3.5',
     r2Key: 'Guusha-Ganacsigaaga-0.pdf',
     thankYouUrl: 'https://www.raadeeyenets01.co/guusha-buug'
   },
