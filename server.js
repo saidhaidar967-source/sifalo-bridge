@@ -484,6 +484,142 @@ app.get('/pay-status', async (req, res) => {
     });
   }
 });
+// ============================================================
+// CART CHECKOUT — charges for multiple books in one transaction.
+// Add this after your existing /pay route in server.js.
+// ============================================================
+
+// POST /pay-cart — body: { items: [{ productId, qty }], phone, method, fbp, fbc }
+app.post('/pay-cart', async (req, res) => {
+  const { items, phone, method, fbp, fbc } = req.body || {};
+  const gateway = GATEWAY_MAP[method];
+
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'Cart is empty.' });
+  }
+  if (!phone || !/^\d{7,15}$/.test(String(phone).replace(/\s+/g, ''))) {
+    return res.status(400).json({ error: 'Enter a valid phone number.' });
+  }
+  if (!gateway) {
+    return res.status(400).json({ error: 'Choose a payment method.' });
+  }
+
+  // Validate every product id and recompute the total server-side —
+  // never trust price or quantity sent from the browser.
+  const resolvedItems = [];
+  let total = 0;
+  for (const item of items) {
+    const productInfo = PRODUCTS[item.productId];
+    if (!productInfo) {
+      return res.status(400).json({ error: `Unknown product: ${item.productId}` });
+    }
+    const qty = Math.max(1, parseInt(item.qty, 10) || 1);
+    total += parseFloat(productInfo.price) * qty;
+    resolvedItems.push({ productId: item.productId, productInfo, qty });
+  }
+  total = Math.round(total * 100) / 100;
+
+  const orderId = crypto.randomBytes(8).toString('hex');
+  const normalizedPhone = String(phone).replace(/\D/g, '');
+
+  let sifaloData;
+  const sifaloCallStart = Date.now();
+  console.log(`[${orderId}] Sending cart charge to Sifalo — total $${total} — ${resolvedItems.length} item(s)`);
+  try {
+    const { data } = await axios.post(
+      'https://api.sifalopay.com/gateway/',
+      {
+        account: normalizedPhone,
+        gateway,
+        amount: total.toFixed(2),
+        currency: 'USD',
+        order_id: orderId
+      },
+      {
+        auth: { username: SIFALO_USERNAME, password: SIFALO_API_KEY },
+        timeout: 45000
+      }
+    );
+    sifaloData = data;
+    console.log(`[${orderId}] Sifalo responded after ${Date.now() - sifaloCallStart}ms — code: ${data.code}`);
+  } catch (err) {
+    console.error('Cart payment request failed:', err.response?.data || err.message);
+    return res.status(502).json({ error: 'Could not reach payment provider. Please try again.' });
+  }
+
+  const { code, sid, response } = sifaloData;
+
+  // 601 — success. Fire one Meta Purchase event for the whole order,
+  // then mint one download token per distinct book.
+  if (code === '601' || code === 601) {
+    try {
+      const userData = {
+        client_ip_address: req.ip,
+        client_user_agent: req.headers['user-agent'],
+        ph: [crypto.createHash('sha256').update(normalizedPhone).digest('hex')]
+      };
+      if (fbp) userData.fbp = fbp;
+      if (fbc) userData.fbc = fbc;
+
+      await axios.post(
+        `https://graph.facebook.com/v19.0/${FB_PIXEL_ID}/events?access_token=${FB_ACCESS_TOKEN}`,
+        {
+          data: [{
+            event_name: 'Purchase',
+            event_time: Math.floor(Date.now() / 1000),
+            event_id: orderId,
+            action_source: 'website',
+            event_source_url: `${BASE_URL}/pay-cart`,
+            user_data: userData,
+            custom_data: {
+              currency: 'USD',
+              value: total,
+              contents: resolvedItems.map(i => ({
+                id: i.productId,
+                quantity: i.qty,
+                item_price: parseFloat(i.productInfo.price)
+              })),
+              order_id: orderId
+            }
+          }]
+        }
+      ).catch(metaErr => console.error('Meta CAPI failed (cart):', metaErr.response?.data || metaErr.message));
+
+      // One token per distinct book — quantity affects price, not link count.
+      const downloads = [];
+      for (const i of resolvedItems) {
+        if (!i.productInfo.r2Key) continue;
+        const token = crypto.randomBytes(24).toString('hex');
+        await kvPutToken(
+          token,
+          { product: i.productId, sid, orderId, createdAt: Date.now(), usesRemaining: 3 },
+          TOKEN_TTL_SECONDS
+        );
+        downloads.push({
+          product: i.productId,
+          name: i.productInfo.name,
+          downloadUrl: `${BASE_URL}/download/file?token=${token}`
+        });
+      }
+
+      return res.json({ status: 'success', orderId, total, downloads });
+    } catch (err) {
+      console.error('Cart post-payment processing failed:', err.response?.data || err.message);
+      return res.status(500).json({
+        status: 'success_no_download',
+        error: 'Payment succeeded but we could not prepare your downloads. Contact support with reference: ' + sid
+      });
+    }
+  }
+
+  // 603 — pending, same as your existing /pay route.
+  if (code === '603' || code === 603) {
+    return res.json({ status: 'pending', sid, message: response });
+  }
+
+  // 604 / 600 — insufficient funds / failed.
+  return res.status(402).json({ status: 'failed', code, message: response });
+});
 app.get('/', (req, res) => res.send('Sifalo Pay bridge is running.'));
 
 app.listen(PORT, () => console.log(`Sifalo bridge running on port ${PORT}`));
