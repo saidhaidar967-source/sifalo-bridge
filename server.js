@@ -33,18 +33,18 @@ const TOKEN_TTL_SECONDS = TOKEN_TTL_MINUTES * 60;
 // shows the download button.
 const PRODUCTS = {
   book: {
-    name: 'Dalbo Buugga',
+    name: 'Siraha Ganacsi Ee Aan Laguu Sheegin',
     price: '0.5',
     r2Key: 'siraha-ganacsi-01.pdf',
   },
   guusha: {
     name: 'Guusha Ganacsigaaga',
-    price: '0.5',
+    price: '0.50',
     r2Key: 'Guusha-Ganacsigaaga-0.pdf',
   },
   billow: {
-    name: 'Billow Ganacsigaaga',
-    price: '0.5',
+    name: 'Sidee Loo Billaabaa Loona Badbaadiyaa Ganacsi?',
+    price: '0.50',
     r2Key: 'billow-ganacsigaaga.pdf',
   }
 };
