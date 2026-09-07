@@ -40,7 +40,7 @@ const PRODUCTS = {
   guusha: {
     name: 'Guusha Ganacsigaaga',
     price: '0.50',
-    r2Key: 'Guusha-Ganacsigaaga-0.pdf',
+    r2Key: 'guusha-ganacsigaaga-1.pdf',
   },
   billow: {
     name: 'Sidee Loo Billaabaa Loona Badbaadiyaa Ganacsi?',
