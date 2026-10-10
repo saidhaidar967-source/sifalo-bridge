@@ -2,277 +2,60 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
-const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
+const { Pool } = require('pg');
+
 const app = express();
-app.use(express.json());
+app.set('trust proxy', 1); // Railway sits behind a proxy
+app.use(express.json({ limit: '20kb' }));
 app.use(cors());
+
 const {
   SIFALO_USERNAME,
   SIFALO_API_KEY,
   FB_PIXEL_ID,
   FB_ACCESS_TOKEN,
   BASE_URL,
-  CF_ACCOUNT_ID,
-  CF_API_TOKEN,
-  CF_KV_NAMESPACE_ID,
-  R2_ACCESS_KEY_ID,
-  R2_SECRET_ACCESS_KEY,
-  R2_BUCKET_NAME,
-  R2_ENDPOINT,
+  DATABASE_URL,
+  ADMIN_PASSWORD,
+  DELIVERED_BASE = '74',   // books already delivered before this system existed
   PORT = 3000
 } = process.env;
 
-// How long a download link stays valid after payment, in minutes.
-const TOKEN_TTL_MINUTES = 10;
-const TOKEN_TTL_SECONDS = TOKEN_TTL_MINUTES * 60;
+const DELIVERED_START = parseInt(DELIVERED_BASE, 10) || 0;
 
-// Add every product you sell here. Each product with an r2Key needs its
-// own thankYouUrl — the Systeme.io page the customer lands on after
-// paying, where the download-confirmation block reads the ?token= and
-// shows the download button.
+// ------------------------------------------------------------------
+// Catalogue + delivery rules (the server is the only source of prices)
+// ------------------------------------------------------------------
 const PRODUCTS = {
-  book: {
-    name: 'Siraha Ganacsi Ee Aan Laguu Sheegin',
-    price: '4.99',
-    r2Key: 'siraha-ganacsi-01.pdf',
-  },
-  guusha: {
-    name: 'Guusha Ganacsigaaga',
-    price: '3.50',
-    r2Key: 'guusha-ganacsigaaga-1.pdf',
-  },
-  billow: {
-    name: 'Sidee Loo Billaabaa Loona Badbaadiyaa Ganacsi?',
-    price: '4.70',
-    r2Key: 'billow-ganacsigaaga.pdf',
-  }
+  book:   { name: 'Siraha Ganacsi Ee Aan Laguu Sheegin',              price: '4.99' },
+  guusha: { name: 'Guusha Ganacsigaaga',                              price: '3.50' },
+  billow: { name: 'Sidee Loo Billaabaa Loona Badbaadiyaa Ganacsi?',   price: '4.70' }
 };
 
-// R2 client (S3-compatible).
-const r2 = new S3Client({
-  region: 'auto',
-  endpoint: R2_ENDPOINT,
-  credentials: {
-    accessKeyId: R2_ACCESS_KEY_ID,
-    secretAccessKey: R2_SECRET_ACCESS_KEY
-  }
-});
+const REGIONS = {
+  benadir:      'Benadir / Mogadishu',
+  somaliland:   'Somaliland',
+  puntland:     'Puntland',
+  southwest:    'Southwest',
+  galmudug:     'Galmudug',
+  hirshabelle:  'Hirshabelle',
+  northeastern: 'Northeastern',
+  jubbaland:    'Jubbaland'
+};
 
-// Cloudflare KV helpers, called over the REST API since Railway can't use
-// native KV bindings.
-const KV_BASE = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}`;
-
-async function kvPutToken(token, payload, ttlSeconds) {
-  await axios.put(
-    `${KV_BASE}/values/${encodeURIComponent(token)}?expiration_ttl=${ttlSeconds}`,
-    JSON.stringify(payload),
-    {
-      headers: {
-        Authorization: `Bearer ${CF_API_TOKEN}`,
-        'Content-Type': 'text/plain'
-      }
-    }
-  );
+// Mogadishu: 1 book $1.50, 2+ books $2.00
+// Everywhere else: 1 book $4, 2 books $7, 3+ books $10
+function deliveryFeeCents(regionId, books) {
+  if (regionId === 'benadir') return books <= 1 ? 150 : 200;
+  if (books <= 1) return 400;
+  if (books === 2) return 700;
+  return 1000;
 }
+const dollars = cents => (cents / 100).toFixed(2);
 
-async function kvGetToken(token) {
-  try {
-    const { data } = await axios.get(
-      `${KV_BASE}/values/${encodeURIComponent(token)}`,
-      { headers: { Authorization: `Bearer ${CF_API_TOKEN}` } }
-    );
-    return typeof data === 'string' ? JSON.parse(data) : data;
-  } catch (err) {
-    if (err.response?.status === 404) return null;
-    throw err;
-  }
-}
-
-// /buy — start Sifalo checkout.
-app.get('/buy', async (req, res) => {
-  const productId = req.query.product;
-  const product = PRODUCTS[productId];
-
-  if (!product) {
-    return res.status(404).send('Unknown product.');
-  }
-
-  const orderId = crypto.randomBytes(8).toString('hex');
-  const returnUrl = `${BASE_URL}/confirm?order_id=${orderId}&product=${productId}`;
-
-  try {
-    const { data } = await axios.post(
-      'https://api.sifalopay.com/gateway/',
-      {
-        amount: product.price,
-        gateway: 'checkout',
-        currency: 'USD',
-        return_url: returnUrl
-      },
-      { auth: { username: SIFALO_USERNAME, password: SIFALO_API_KEY } }
-    );
-
-    const { key, token } = data;
-    res.redirect(
-      `https://pay.sifalo.com/checkout/?key=${encodeURIComponent(key)}&token=${encodeURIComponent(token)}`
-    );
-  } catch (err) {
-    console.error('Create payment failed:', err.response?.data || err.message);
-    res.status(500).send('Could not start payment. Please try again in a moment.');
-  }
-});
-
-// /confirm — verify payment, fire Meta Purchase, issue a temporary download link.
-app.get('/confirm', async (req, res) => {
-  const { sid, product, order_id } = req.query;
-  const productInfo = PRODUCTS[product];
-
-  if (!sid) {
-    return res.status(400).send('Missing payment reference. Payment may not have completed.');
-  }
-
-  try {
-    const { data } = await axios.post(
-      'https://api.sifalopay.com/gateway/verify.php',
-      { sid },
-      { auth: { username: SIFALO_USERNAME, password: SIFALO_API_KEY } }
-    );
-
-    if (data.status === 'success' && productInfo) {
-      try {
-        const userData = {
-          client_ip_address: req.ip,
-          client_user_agent: req.headers['user-agent']
-        };
-
-        if (data.account) {
-          const normalizedPhone = String(data.account).replace(/\D/g, '');
-          userData.ph = [crypto.createHash('sha256').update(normalizedPhone).digest('hex')];
-        }
-
-        await axios.post(
-          `https://graph.facebook.com/v19.0/${FB_PIXEL_ID}/events?access_token=${FB_ACCESS_TOKEN}`,
-          {
-            data: [
-              {
-                event_name: 'Purchase',
-                event_time: Math.floor(Date.now() / 1000),
-                event_id: order_id || sid,
-                action_source: 'website',
-                event_source_url: `${BASE_URL}/confirm`,
-                user_data: userData,
-                custom_data: {
-                  currency: 'USD',
-                  value: parseFloat(productInfo.price),
-                  content_name: productInfo.name,
-                  order_id: order_id || sid
-                }
-              }
-            ]
-          }
-        );
-      } catch (metaErr) {
-        console.error('Meta CAPI failed:', metaErr.response?.data || metaErr.message);
-      }
-
-      if (productInfo.r2Key) {
-        const token = crypto.randomBytes(24).toString('hex');
-
-        try {
-          await kvPutToken(
-            token,
-            { product, sid, orderId: order_id || sid, createdAt: Date.now(), usesRemaining: 3 },
-            TOKEN_TTL_SECONDS
-          );
-        } catch (kvErr) {
-          console.error('KV token store failed:', kvErr.response?.data || kvErr.message);
-          return res.status(500).send('Payment confirmed, but we could not prepare your download. Contact support with reference: ' + sid);
-        }
-
-        return res.redirect(`${BASE_URL}/download?token=${token}`);
-      }
-
-      return res.redirect(productInfo.downloadUrl);
-    }
-
-    res.send('Payment was not completed. If you were charged, contact support and share this reference: ' + sid);
-  } catch (err) {
-    console.error('Verify failed:', err.response?.data || err.message);
-    res.status(500).send('Could not verify your payment. Contact support with reference: ' + sid);
-  }
-});
-
-// /download/file — validates the token again and streams the PDF straight
-// from the private R2 bucket. The real file location is never exposed.
-app.get('/download/file', async (req, res) => {
-  const { token } = req.query;
-
-  const purposeHeader = (req.headers['purpose'] || req.headers['sec-purpose'] || '').toLowerCase();
-  if (purposeHeader.includes('prefetch') || purposeHeader.includes('prerender')) {
-    return res.status(204).end();
-  }
-
-  if (!token) {
-    return res.status(400).send('Missing download link.');
-  }
-
-  const record = await kvGetToken(token).catch(err => {
-    console.error('KV token lookup failed:', err.response?.data || err.message);
-    return undefined;
-  });
-
-  if (record === undefined) {
-    return res.status(500).send('Something went wrong preparing your download. Please try again shortly.');
-  }
-
-  if (!record || !(record.usesRemaining > 0)) {
-    return res.status(410).send('This download link has expired or is invalid.');
-  }
-
-  const productInfo = PRODUCTS[record.product];
-  if (!productInfo) {
-    return res.status(404).send('Product not found for this download link.');
-  }
-
-  try {
-    const command = new GetObjectCommand({
-      Bucket: R2_BUCKET_NAME,
-      Key: productInfo.r2Key
-    });
-    const object = await r2.send(command);
-
-    res.setHeader('Content-Type', object.ContentType || 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${productInfo.r2Key}"`);
-    if (object.ContentLength) {
-      res.setHeader('Content-Length', object.ContentLength);
-    }
-
-    object.Body.on('end', () => {
-      const remainingTtl = Math.max(
-        60,
-        Math.floor((record.createdAt + TOKEN_TTL_SECONDS * 1000 - Date.now()) / 1000)
-      );
-      kvPutToken(
-        token,
-        { ...record, usesRemaining: record.usesRemaining - 1 },
-        remainingTtl
-      ).catch(err => console.error('KV token update failed:', err.response?.data || err.message));
-    });
-
-    object.Body.pipe(res);
-  } catch (err) {
-    console.error('R2 stream failed:', err.message);
-    res.status(500).send('Could not retrieve your file. Contact support with your payment reference.');
-  }
-});
-// ============================================================
-// DIRECT E-WALLET PAYMENT ROUTE (Doc 1 style — no Sifalo redirect)
-// Add this to server.js alongside your existing /buy and /confirm routes.
-// Requires: app.use(express.json()) enabled globally or on this route.
-// ============================================================
-
-// Map your UI's method labels to Sifalo's gateway values.
 const GATEWAY_MAP = {
   evc: 'waafi',
   zaad: 'waafi',
@@ -281,166 +64,96 @@ const GATEWAY_MAP = {
   premier: 'pbwallet'
 };
 
-// /pay — charge directly, no redirect to pay.sifalo.com.
-// The customer approves via USSD PIN prompt on their own phone; this
-// request is expected to hold open until Sifalo has a final result
-// (or times out), based on what you've seen with xikmabooks' flow.
-// CONFIRM THIS ASSUMPTION IN TESTING — see TESTING.md.
-app.post('/pay', async (req, res) => {
-  const { product, phone, method, fbp, fbc } = req.body || {};
-  const productInfo = PRODUCTS[product];
-  const gateway = GATEWAY_MAP[method];
+// ------------------------------------------------------------------
+// Database (Railway Postgres)
+// ------------------------------------------------------------------
+const pool = DATABASE_URL
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl: /railway\.internal|localhost|127\.0\.0\.1/.test(DATABASE_URL) ? false : { rejectUnauthorized: false }
+    })
+  : null;
 
-  if (!productInfo) {
-    return res.status(404).json({ error: 'Unknown product.' });
-  }
-  if (!phone || !/^\d{7,15}$/.test(String(phone).replace(/\s+/g, ''))) {
-    return res.status(400).json({ error: 'Enter a valid phone number.' });
-  }
-  if (!gateway) {
-    return res.status(400).json({ error: 'Choose a payment method.' });
-  }
+async function initDb() {
+  if (!pool) throw new Error('DATABASE_URL is not set');
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS orders (
+      id              TEXT PRIMARY KEY,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+      name            TEXT NOT NULL,
+      email           TEXT NOT NULL,
+      phone           TEXT NOT NULL,
+      method          TEXT NOT NULL,
+      region_id       TEXT NOT NULL,
+      region          TEXT NOT NULL,
+      city            TEXT NOT NULL,
+      items           JSONB NOT NULL,
+      books           INTEGER NOT NULL,
+      books_total     NUMERIC(10,2) NOT NULL,
+      delivery_fee    NUMERIC(10,2) NOT NULL,
+      total           NUMERIC(10,2) NOT NULL,
+      sid             TEXT,
+      pay_status      TEXT NOT NULL DEFAULT 'pending',
+      pay_message     TEXT,
+      paid_at         TIMESTAMPTZ,
+      delivery_status TEXT NOT NULL DEFAULT 'new',
+      delivered_at    TIMESTAMPTZ,
+      fbp             TEXT,
+      fbc             TEXT,
+      client_ip       TEXT,
+      client_ua       TEXT
+    )`);
+  await pool.query('CREATE INDEX IF NOT EXISTS orders_created_idx ON orders (created_at DESC)');
+}
 
-  const orderId = crypto.randomBytes(8).toString('hex');
-  const normalizedPhone = String(phone).replace(/\D/g, '');
+function mapOrder(r) {
+  return {
+    id: r.id,
+    createdAt: r.created_at,
+    name: r.name,
+    email: r.email,
+    phone: r.phone,
+    method: r.method,
+    region: r.region,
+    city: r.city,
+    items: r.items,
+    books: r.books,
+    booksTotal: Number(r.books_total),
+    deliveryFee: Number(r.delivery_fee),
+    total: Number(r.total),
+    sid: r.sid,
+    payStatus: r.pay_status,
+    payMessage: r.pay_message,
+    paidAt: r.paid_at,
+    deliveryStatus: r.delivery_status,
+    deliveredAt: r.delivered_at
+  };
+}
 
-  let sifaloData;
-  const sifaloCallStart = Date.now();
-  console.log(`[${orderId}] Sending charge request to Sifalo at ${new Date(sifaloCallStart).toISOString()}`);
+// ------------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------------
+const clean = (v, max) => String(v == null ? '' : v).trim().slice(0, max);
+const sha256 = s => crypto.createHash('sha256').update(s).digest('hex');
+
+function resolveRegionId(shipping) {
+  if (!shipping) return null;
+  if (shipping.regionId && REGIONS[shipping.regionId]) return shipping.regionId;
+  const label = String(shipping.region || '').trim().toLowerCase();
+  return Object.keys(REGIONS).find(id => REGIONS[id].toLowerCase() === label) || null;
+}
+
+async function sendMetaPurchase(order, extra = {}) {
+  if (!FB_PIXEL_ID || !FB_ACCESS_TOKEN) return;
   try {
-    const { data } = await axios.post(
-      'https://api.sifalopay.com/gateway/',
-      {
-        account: normalizedPhone,
-        gateway,
-        amount: productInfo.price,
-        currency: 'USD',
-        order_id: orderId
-      },
-      {
-        auth: { username: SIFALO_USERNAME, password: SIFALO_API_KEY },
-        // USSD approval may take a while — give it room before Axios times out.
-        // Tune this once you see real response times in testing.
-        timeout: 45000
-      }
-    );
-    sifaloData = data;
-    console.log(`[${orderId}] Sifalo responded after ${Date.now() - sifaloCallStart}ms — code: ${data.code}`);
-  } catch (err) {
-    console.log(`[${orderId}] Sifalo call failed/timed out after ${Date.now() - sifaloCallStart}ms`);
-    console.error('Direct payment request failed:', err.response?.data || err.message);
-    return res.status(502).json({ error: 'Could not reach payment provider. Please try again.' });
-  }
-
-  const { code, sid, response } = sifaloData;
-
-  // 601 — success. Do the same post-purchase work /confirm does today:
-  // Meta CAPI + R2 token mint, but with data we already have (no verify.php round trip needed).
-  if (code === '601' || code === 601) {
-    try {
-      const userData = {
-        client_ip_address: req.ip,
-        client_user_agent: req.headers['user-agent'],
-        ph: [crypto.createHash('sha256').update(normalizedPhone).digest('hex')]
-      };
-      // Bridges the browser pixel to this server-side event so Meta can
-      // attribute the purchase back to the ad click that led here.
-      if (fbp) userData.fbp = fbp;
-      if (fbc) userData.fbc = fbc;
-
-      await axios.post(
-        `https://graph.facebook.com/v19.0/${FB_PIXEL_ID}/events?access_token=${FB_ACCESS_TOKEN}`,
-        {
-          data: [{
-            event_name: 'Purchase',
-            event_time: Math.floor(Date.now() / 1000),
-            event_id: orderId,
-            action_source: 'website',
-            event_source_url: `${BASE_URL}/pay`,
-            user_data: userData,
-            custom_data: {
-              currency: 'USD',
-              value: parseFloat(productInfo.price),
-              content_name: productInfo.name,
-              order_id: orderId
-            }
-          }]
-        }
-      ).catch(metaErr => console.error('Meta CAPI failed:', metaErr.response?.data || metaErr.message));
-
-      if (productInfo.r2Key) {
-        const token = crypto.randomBytes(24).toString('hex');
-        await kvPutToken(
-          token,
-          { product, sid, orderId, createdAt: Date.now(), usesRemaining: 3 },
-          TOKEN_TTL_SECONDS
-        );
-       return res.json({ status: 'success', downloadUrl: `${BASE_URL}/download/file?token=${token}` });
-      }
-
-      return res.json({ status: 'success', downloadUrl: productInfo.downloadUrl });
-    } catch (err) {
-      console.error('Post-payment processing failed:', err.response?.data || err.message);
-      return res.status(500).json({
-        status: 'success_no_download',
-        error: 'Payment succeeded but we could not prepare your download. Contact support with reference: ' + sid
-      });
-    }
-  }
-
-  // 603 — pending. Return this as-is; frontend should poll /pay-status?sid=... (below)
-  // ONLY if testing shows the initial request returns before final resolution.
-  if (code === '603' || code === 603) {
-    return res.json({ status: 'pending', sid, message: response });
-  }
-
-  // 604 / 600 — insufficient funds / failed.
-  return res.status(402).json({ status: 'failed', code, message: response });
-});
-
-// /pay-status — polling fallback, only needed if 603 turns out to be common
-// and doesn't resolve within the original request. Delete this if testing
-// shows /pay already blocks until final status.
-app.get('/pay-status', async (req, res) => {
-  const { sid, product, fbp, fbc } = req.query;
-  if (!sid) return res.status(400).json({ error: 'Missing sid.' });
-
-  let data;
-  try {
-    const result = await axios.post(
-      'https://api.sifalopay.com/gateway/verify.php',
-      { sid },
-      { auth: { username: SIFALO_USERNAME, password: SIFALO_API_KEY } }
-    );
-    data = result.data;
-  } catch (err) {
-    console.error('Status check failed:', err.response?.data || err.message);
-    return res.status(500).json({ error: 'Could not check status.' });
-  }
-
-  // Still pending or failed — just relay Sifalo's status, nothing to complete yet.
-  if (data.status !== 'success') {
-    return res.json({ status: data.status, code: data.code, message: data.response });
-  }
-
-  // Resolved to success on a delayed check — do the same completion work
-  // /pay does on an immediate 601: Meta Purchase event + R2 download token.
-  const productInfo = PRODUCTS[product];
-  if (!productInfo) {
-    return res.json({ status: 'success_no_download', sid, error: 'Missing product reference for this order.' });
-  }
-
-  try {
-    const normalizedPhone = data.account ? String(data.account).replace(/\D/g, '') : '';
     const userData = {
-      client_ip_address: req.ip,
-      client_user_agent: req.headers['user-agent']
+      ph: [sha256(String(order.phone).replace(/\D/g, ''))],
+      em: [sha256(String(order.email).trim().toLowerCase())]
     };
-    if (normalizedPhone) {
-      userData.ph = [crypto.createHash('sha256').update(normalizedPhone).digest('hex')];
-    }
-    if (fbp) userData.fbp = fbp;
-    if (fbc) userData.fbc = fbc;
+    if (order.client_ip) userData.client_ip_address = order.client_ip;
+    if (order.client_ua) userData.client_user_agent = order.client_ua;
+    if (order.fbp) userData.fbp = order.fbp;
+    if (order.fbc) userData.fbc = order.fbc;
 
     await axios.post(
       `https://graph.facebook.com/v19.0/${FB_PIXEL_ID}/events?access_token=${FB_ACCESS_TOKEN}`,
@@ -448,175 +161,320 @@ app.get('/pay-status', async (req, res) => {
         data: [{
           event_name: 'Purchase',
           event_time: Math.floor(Date.now() / 1000),
-          event_id: sid,
+          event_id: order.id,
           action_source: 'website',
-          event_source_url: `${BASE_URL}/pay-status`,
+          event_source_url: `${BASE_URL}/pay`,
           user_data: userData,
           custom_data: {
             currency: 'USD',
-            value: parseFloat(productInfo.price),
-            content_name: productInfo.name,
-            order_id: sid
+            value: Number(order.total),
+            content_type: 'product',
+            contents: (order.items || []).map(i => ({ id: i.productId, quantity: i.qty, item_price: i.price })),
+            order_id: order.id
           }
         }]
       }
-    ).catch(metaErr => console.error('Meta CAPI failed (pay-status):', metaErr.response?.data || metaErr.message));
-
-    if (productInfo.r2Key) {
-      const token = crypto.randomBytes(24).toString('hex');
-      await kvPutToken(
-        token,
-        { product, sid, orderId: sid, createdAt: Date.now(), usesRemaining: 3 },
-        TOKEN_TTL_SECONDS
-      );
-     return res.json({ status: 'success', downloadUrl: `${BASE_URL}/download/file?token=${token}` });
-    }
-
-    return res.json({ status: 'success', downloadUrl: productInfo.downloadUrl });
+    );
   } catch (err) {
-    console.error('Post-payment processing failed (pay-status):', err.response?.data || err.message);
-    return res.status(500).json({
-      status: 'success_no_download',
-      error: 'Payment succeeded but we could not prepare your download. Contact support with reference: ' + sid
-    });
+    console.error('Meta CAPI failed:', err.response?.data || err.message);
   }
-});
-// ============================================================
-// CART CHECKOUT — charges for multiple books in one transaction.
-// Add this after your existing /pay route in server.js.
-// ============================================================
+}
 
-// POST /pay-cart — body: { items: [{ productId, qty }], phone, method, fbp, fbc }
-app.post('/pay-cart', async (req, res) => {
-  const { items, phone, method, fbp, fbc } = req.body || {};
-  const gateway = GATEWAY_MAP[method];
+// Marks an order paid exactly once. Returns the row if THIS call changed it
+// (so the Meta event fires once), or null if it was already paid.
+async function markPaid(orderId, sid) {
+  const { rows } = await pool.query(
+    `UPDATE orders
+        SET pay_status = 'paid', paid_at = now(), sid = COALESCE($2, sid), pay_message = NULL
+      WHERE id = $1 AND pay_status <> 'paid'
+      RETURNING *`,
+    [orderId, sid || null]
+  );
+  return rows[0] || null;
+}
 
-  if (!Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ error: 'Cart is empty.' });
+// ------------------------------------------------------------------
+// Checkout: /pay (one book) and /pay-cart (several) share one handler
+// ------------------------------------------------------------------
+async function handleOrder(req, res, rawItems) {
+  const b = req.body || {};
+  const gateway = GATEWAY_MAP[b.method];
+  const name = clean(b.name, 100);
+  const email = clean(b.email, 150).toLowerCase();
+  const city = clean(b.shipping && b.shipping.city, 100);
+  const regionId = resolveRegionId(b.shipping);
+  const phone = String(b.phone || '').replace(/\s+/g, '');
+
+  if (!name) return res.status(400).json({ error: 'Enter your name.' });
+  if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: 'Enter a valid email.' });
+  if (!regionId) return res.status(400).json({ error: 'Choose where you are.' });
+  if (!city) return res.status(400).json({ error: 'Enter your city or district.' });
+  if (!/^\d{7,15}$/.test(phone)) return res.status(400).json({ error: 'Enter a valid phone number.' });
+  if (!gateway) return res.status(400).json({ error: 'Choose a payment method.' });
+  if (!Array.isArray(rawItems) || rawItems.length === 0) return res.status(400).json({ error: 'Cart is empty.' });
+
+  // Merge duplicates, validate ids, recompute everything server-side.
+  const merged = new Map();
+  for (const it of rawItems) {
+    const info = PRODUCTS[it && it.productId];
+    if (!info) return res.status(400).json({ error: `Unknown product: ${it && it.productId}` });
+    const qty = Math.min(99, Math.max(1, parseInt(it.qty, 10) || 1));
+    merged.set(it.productId, (merged.get(it.productId) || 0) + qty);
   }
-  if (!phone || !/^\d{7,15}$/.test(String(phone).replace(/\s+/g, ''))) {
-    return res.status(400).json({ error: 'Enter a valid phone number.' });
+  const items = [];
+  let books = 0, booksCents = 0;
+  for (const [productId, q] of merged) {
+    const qty = Math.min(99, q);
+    const priceCents = Math.round(parseFloat(PRODUCTS[productId].price) * 100);
+    items.push({ productId, title: PRODUCTS[productId].name, price: priceCents / 100, qty });
+    books += qty;
+    booksCents += priceCents * qty;
   }
-  if (!gateway) {
-    return res.status(400).json({ error: 'Choose a payment method.' });
+  const feeCents = deliveryFeeCents(regionId, books);
+  const totalCents = booksCents + feeCents;
+
+  const orderId = crypto.randomBytes(5).toString('hex').toUpperCase(); // e.g. 3F9A1C7B2E
+  const normalizedPhone = phone.replace(/\D/g, '');
+
+  // 1) Save the order BEFORE charging, so nothing is ever lost.
+  try {
+    await pool.query(
+      `INSERT INTO orders
+        (id, name, email, phone, method, region_id, region, city, items, books,
+         books_total, delivery_fee, total, fbp, fbc, client_ip, client_ua)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+      [orderId, name, email, normalizedPhone, b.method, regionId, REGIONS[regionId], city,
+       JSON.stringify(items), books, dollars(booksCents), dollars(feeCents), dollars(totalCents),
+       clean(b.fbp, 200) || null, clean(b.fbc, 300) || null, req.ip || null,
+       clean(req.headers['user-agent'], 300) || null]
+    );
+  } catch (err) {
+    console.error(`[${orderId}] Could not save order:`, err.message);
+    return res.status(503).json({ error: 'Service is temporarily unavailable. Please try again in a moment.' });
   }
 
-  // Validate every product id and recompute the total server-side —
-  // never trust price or quantity sent from the browser.
-  const resolvedItems = [];
-  let total = 0;
-  for (const item of items) {
-    const productInfo = PRODUCTS[item.productId];
-    if (!productInfo) {
-      return res.status(400).json({ error: `Unknown product: ${item.productId}` });
-    }
-    const qty = Math.max(1, parseInt(item.qty, 10) || 1);
-    total += parseFloat(productInfo.price) * qty;
-    resolvedItems.push({ productId: item.productId, productInfo, qty });
-  }
-  total = Math.round(total * 100) / 100;
-
-  const orderId = crypto.randomBytes(8).toString('hex');
-  const normalizedPhone = String(phone).replace(/\D/g, '');
-
+  // 2) Charge the full amount: books + delivery.
+  console.log(`[${orderId}] Charging $${dollars(totalCents)} (${books} book(s) + $${dollars(feeCents)} delivery to ${REGIONS[regionId]})`);
   let sifaloData;
-  const sifaloCallStart = Date.now();
-  console.log(`[${orderId}] Sending cart charge to Sifalo — total $${total} — ${resolvedItems.length} item(s)`);
   try {
     const { data } = await axios.post(
       'https://api.sifalopay.com/gateway/',
       {
         account: normalizedPhone,
         gateway,
-        amount: total.toFixed(2),
+        amount: dollars(totalCents),
         currency: 'USD',
         order_id: orderId
       },
-      {
-        auth: { username: SIFALO_USERNAME, password: SIFALO_API_KEY },
-        timeout: 45000
-      }
+      { auth: { username: SIFALO_USERNAME, password: SIFALO_API_KEY }, timeout: 45000 }
     );
     sifaloData = data;
-    console.log(`[${orderId}] Sifalo responded after ${Date.now() - sifaloCallStart}ms — code: ${data.code}`);
   } catch (err) {
-    console.error('Cart payment request failed:', err.response?.data || err.message);
+    console.error(`[${orderId}] Sifalo call failed:`, err.response?.data || err.message);
+    await pool.query(
+      `UPDATE orders SET pay_status='failed', pay_message=$2 WHERE id=$1`,
+      [orderId, 'No response from payment provider - check the Sifalo dashboard before assuming it failed']
+    ).catch(() => {});
     return res.status(502).json({ error: 'Could not reach payment provider. Please try again.' });
   }
 
   const { code, sid, response } = sifaloData;
 
-  // 601 — success. Fire one Meta Purchase event for the whole order,
-  // then mint one download token per distinct book.
+  // 601 — paid
   if (code === '601' || code === 601) {
-    try {
-      const userData = {
-        client_ip_address: req.ip,
-        client_user_agent: req.headers['user-agent'],
-        ph: [crypto.createHash('sha256').update(normalizedPhone).digest('hex')]
-      };
-      if (fbp) userData.fbp = fbp;
-      if (fbc) userData.fbc = fbc;
-
-      await axios.post(
-        `https://graph.facebook.com/v19.0/${FB_PIXEL_ID}/events?access_token=${FB_ACCESS_TOKEN}`,
-        {
-          data: [{
-            event_name: 'Purchase',
-            event_time: Math.floor(Date.now() / 1000),
-            event_id: orderId,
-            action_source: 'website',
-            event_source_url: `${BASE_URL}/pay-cart`,
-            user_data: userData,
-            custom_data: {
-              currency: 'USD',
-              value: total,
-              contents: resolvedItems.map(i => ({
-                id: i.productId,
-                quantity: i.qty,
-                item_price: parseFloat(i.productInfo.price)
-              })),
-              order_id: orderId
-            }
-          }]
-        }
-      ).catch(metaErr => console.error('Meta CAPI failed (cart):', metaErr.response?.data || metaErr.message));
-
-      // One token per distinct book — quantity affects price, not link count.
-      const downloads = [];
-      for (const i of resolvedItems) {
-        if (!i.productInfo.r2Key) continue;
-        const token = crypto.randomBytes(24).toString('hex');
-        await kvPutToken(
-          token,
-          { product: i.productId, sid, orderId, createdAt: Date.now(), usesRemaining: 3 },
-          TOKEN_TTL_SECONDS
-        );
-        downloads.push({
-          product: i.productId,
-          name: i.productInfo.name,
-          downloadUrl: `${BASE_URL}/download/file?token=${token}`
-        });
-      }
-
-      return res.json({ status: 'success', orderId, total, downloads });
-    } catch (err) {
-      console.error('Cart post-payment processing failed:', err.response?.data || err.message);
-      return res.status(500).json({
-        status: 'success_no_download',
-        error: 'Payment succeeded but we could not prepare your downloads. Contact support with reference: ' + sid
-      });
-    }
+    const row = await markPaid(orderId, sid).catch(err => {
+      console.error(`[${orderId}] markPaid failed:`, err.message);
+      return null;
+    });
+    if (row) await sendMetaPurchase(row);
+    return res.json({ status: 'success', orderId, total: totalCents / 100, deliveryFee: feeCents / 100 });
   }
 
-  // 603 — pending, same as your existing /pay route.
+  // 603 — waiting for the customer to approve on their phone
   if (code === '603' || code === 603) {
-    return res.json({ status: 'pending', sid, message: response });
+    await pool.query(`UPDATE orders SET sid=$2, pay_message=$3 WHERE id=$1`, [orderId, sid || null, clean(response, 300)]).catch(() => {});
+    return res.json({ status: 'pending', orderId, sid, message: response });
   }
 
-  // 604 / 600 — insufficient funds / failed.
+  // anything else — failed / insufficient funds
+  await pool.query(`UPDATE orders SET pay_status='failed', sid=$2, pay_message=$3 WHERE id=$1`,
+    [orderId, sid || null, clean(response, 300)]).catch(() => {});
   return res.status(402).json({ status: 'failed', code, message: response });
-});
-app.get('/', (req, res) => res.send('Sifalo Pay bridge is running.'));
+}
 
-app.listen(PORT, () => console.log(`Sifalo bridge running on port ${PORT}`));
+app.post('/pay', (req, res) =>
+  handleOrder(req, res, [{ productId: (req.body || {}).product, qty: 1 }]).catch(err => {
+    console.error('/pay crashed:', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  })
+);
+
+app.post('/pay-cart', (req, res) =>
+  handleOrder(req, res, (req.body || {}).items).catch(err => {
+    console.error('/pay-cart crashed:', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  })
+);
+
+// ------------------------------------------------------------------
+// Public: live "books delivered" counter for the storefront
+// ------------------------------------------------------------------
+app.get('/stats', async (req, res) => {
+  res.set('Cache-Control', 'public, max-age=60');
+  try {
+    const { rows } = await pool.query(
+      `SELECT COALESCE(SUM(books),0)::int AS n FROM orders WHERE delivery_status='delivered'`
+    );
+    res.json({ delivered: DELIVERED_START + rows[0].n });
+  } catch (err) {
+    console.error('/stats failed:', err.message);
+    res.json({ delivered: DELIVERED_START });
+  }
+});
+
+// ------------------------------------------------------------------
+// Admin: password login -> signed token (30 days)
+// ------------------------------------------------------------------
+const adminKey = () => crypto.createHash('sha256').update('raadeeye-admin:' + ADMIN_PASSWORD).digest();
+
+function signToken() {
+  const exp = String(Date.now() + 30 * 24 * 60 * 60 * 1000);
+  const sig = crypto.createHmac('sha256', adminKey()).update(exp).digest('hex');
+  return `${exp}.${sig}`;
+}
+function verifyToken(t) {
+  if (!ADMIN_PASSWORD || !t) return false;
+  const [exp, sig] = String(t).split('.');
+  if (!exp || !sig) return false;
+  const expected = crypto.createHmac('sha256', adminKey()).update(exp).digest('hex');
+  if (sig.length !== expected.length) return false;
+  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return false;
+  return Number(exp) > Date.now();
+}
+
+const loginFails = new Map(); // ip -> { count, resetAt }
+app.post('/admin/login', (req, res) => {
+  if (!ADMIN_PASSWORD) return res.status(503).json({ error: 'Admin is not set up (ADMIN_PASSWORD missing).' });
+  const ip = req.ip || 'x';
+  const f = loginFails.get(ip);
+  if (f && f.resetAt > Date.now() && f.count >= 8) {
+    return res.status(429).json({ error: 'Too many attempts. Try again in 15 minutes.' });
+  }
+  const given = crypto.createHash('sha256').update(String((req.body || {}).password || '')).digest();
+  const real = crypto.createHash('sha256').update(ADMIN_PASSWORD).digest();
+  if (!crypto.timingSafeEqual(given, real)) {
+    const cur = f && f.resetAt > Date.now() ? f : { count: 0, resetAt: Date.now() + 15 * 60 * 1000 };
+    cur.count++;
+    loginFails.set(ip, cur);
+    return res.status(401).json({ error: 'Wrong password.' });
+  }
+  loginFails.delete(ip);
+  res.json({ token: signToken() });
+});
+
+function requireAdmin(req, res, next) {
+  const m = /^Bearer (.+)$/.exec(req.headers.authorization || '');
+  if (!m || !verifyToken(m[1])) return res.status(401).json({ error: 'Please log in.' });
+  next();
+}
+
+app.get('/admin', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.sendFile(path.join(__dirname, 'admin.html'));
+});
+
+app.get('/admin/api/orders', requireAdmin, async (req, res) => {
+  const filters = {
+    todo:      `pay_status='paid' AND delivery_status='new'`,
+    pending:   `pay_status <> 'paid'`,
+    delivered: `delivery_status='delivered'`,
+    all:       `TRUE`
+  };
+  const where = filters[req.query.filter] || filters.todo;
+  try {
+    const { rows } = await pool.query(`SELECT * FROM orders WHERE ${where} ORDER BY created_at DESC LIMIT 300`);
+    const sum = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE pay_status='paid' AND delivery_status='new')::int AS to_deliver,
+        COALESCE(SUM(books) FILTER (WHERE delivery_status='delivered'),0)::int   AS delivered_books,
+        COUNT(*) FILTER (WHERE pay_status <> 'paid')::int                        AS unpaid,
+        COALESCE(SUM(total) FILTER (WHERE pay_status='paid'),0)::float           AS revenue
+      FROM orders`);
+    const s = sum.rows[0];
+    res.json({
+      orders: rows.map(mapOrder),
+      summary: {
+        toDeliver: s.to_deliver,
+        deliveredBooks: s.delivered_books,
+        deliveredShown: DELIVERED_START + s.delivered_books,
+        unpaid: s.unpaid,
+        revenue: s.revenue
+      }
+    });
+  } catch (err) {
+    console.error('admin orders failed:', err.message);
+    res.status(500).json({ error: 'Could not load orders.' });
+  }
+});
+
+app.post('/admin/api/orders/:id/delivered', requireAdmin, async (req, res) => {
+  const delivered = !!(req.body || {}).delivered;
+  try {
+    const { rows } = await pool.query(
+      `UPDATE orders
+          SET delivery_status = $2, delivered_at = CASE WHEN $2 = 'delivered' THEN now() ELSE NULL END
+        WHERE id = $1 AND pay_status = 'paid'
+        RETURNING *`,
+      [req.params.id, delivered ? 'delivered' : 'new']
+    );
+    if (!rows[0]) return res.status(400).json({ error: 'Order not found or not paid yet.' });
+    res.json({ order: mapOrder(rows[0]) });
+  } catch (err) {
+    console.error('admin delivered failed:', err.message);
+    res.status(500).json({ error: 'Could not update order.' });
+  }
+});
+
+// Ask Sifalo again about an order that was left pending / unclear.
+app.post('/admin/api/orders/:id/recheck', requireAdmin, async (req, res) => {
+  try {
+    const found = await pool.query('SELECT * FROM orders WHERE id=$1', [req.params.id]);
+    const order = found.rows[0];
+    if (!order) return res.status(404).json({ error: 'Order not found.' });
+    if (order.pay_status === 'paid') return res.json({ order: mapOrder(order) });
+    if (!order.sid) return res.status(400).json({ error: 'No Sifalo reference for this order - check the Sifalo dashboard.' });
+
+    const { data } = await axios.post(
+      'https://api.sifalopay.com/gateway/verify.php',
+      { sid: order.sid },
+      { auth: { username: SIFALO_USERNAME, password: SIFALO_API_KEY } }
+    );
+
+    if (data.status === 'success') {
+      const row = await markPaid(order.id, order.sid);
+      if (row) await sendMetaPurchase(row);
+    } else {
+      await pool.query('UPDATE orders SET pay_message=$2 WHERE id=$1', [order.id, clean(data.response || data.status, 300)]);
+    }
+    const fresh = await pool.query('SELECT * FROM orders WHERE id=$1', [order.id]);
+    res.json({ order: mapOrder(fresh.rows[0]) });
+  } catch (err) {
+    console.error('admin recheck failed:', err.response?.data || err.message);
+    res.status(502).json({ error: 'Could not check with Sifalo.' });
+  }
+});
+
+app.get('/', (req, res) => res.send('Raadeeye Nets order server is running.'));
+
+if (require.main === module) {
+  initDb()
+    .then(() => {
+      app.listen(PORT, () => console.log(`Order server running on port ${PORT}`));
+    })
+    .catch(err => {
+      console.error('Startup failed:', err.message);
+      process.exit(1);
+    });
+}
+
+module.exports = { app, deliveryFeeCents, resolveRegionId, handleOrder };

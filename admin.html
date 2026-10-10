@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex">
+<title>Raadeeye Nets · Orders</title>
+<style>
+  :root{
+    --bg:#fff; --bg-soft:#F3F6FE; --ink:#14213D; --ink-soft:#4A5568; --muted:#8A94A6;
+    --line:#E3E8F2; --blue:#2451D6; --blue-dark:#1B3FAA; --green:#1E9E4A; --red:#D93025; --amber:#B7791F;
+  }
+  *{ box-sizing:border-box; }
+  body{ margin:0; font-family:'Public Sans',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif; background:var(--bg); color:var(--ink); }
+  header{ position:sticky; top:0; z-index:5; background:var(--bg); border-bottom:1px solid var(--line); display:flex; align-items:center; justify-content:space-between; padding:14px 18px; }
+  header b{ font-family:Georgia,'Times New Roman',serif; font-size:1.1rem; }
+  header button{ background:var(--bg-soft); border:1.5px solid var(--line); border-radius:999px; padding:7px 14px; color:var(--blue); font-weight:600; font-size:0.82rem; cursor:pointer; }
+  .wrap{ max-width:640px; margin:0 auto; padding:18px 18px 60px; }
+  .login{ max-width:380px; margin:12vh auto 0; padding:0 18px; }
+  .login h1{ font-family:Georgia,serif; font-size:1.4rem; margin:0 0 6px; }
+  .login p{ color:var(--ink-soft); font-size:0.9rem; margin:0 0 18px; }
+  input{ width:100%; padding:12px; border:1.5px solid var(--line); border-radius:8px; font-size:1rem; font-family:inherit; }
+  input:focus{ outline:none; border-color:var(--blue); }
+  .btn{ border:none; border-radius:9px; padding:11px 16px; font-weight:700; font-size:0.88rem; cursor:pointer; font-family:inherit; }
+  .btn-primary{ background:var(--blue); color:#fff; }
+  .btn-primary:active{ background:var(--blue-dark); }
+  .btn-ghost{ background:transparent; border:1.5px solid var(--blue); color:var(--blue); }
+  .btn-ok{ background:var(--green); color:#fff; }
+  .btn:disabled{ opacity:0.55; cursor:wait; }
+  .err{ color:var(--red); font-size:0.85rem; margin:10px 0 0; min-height:1.2em; }
+  .stats{ display:grid; grid-template-columns:repeat(2,1fr); gap:10px; margin-bottom:16px; }
+  .stat{ background:var(--bg-soft); border:1px solid var(--line); border-radius:12px; padding:12px 14px; }
+  .stat b{ display:block; font-size:1.3rem; color:var(--blue); }
+  .stat span{ font-size:0.76rem; color:var(--ink-soft); }
+  .tabs{ display:flex; gap:8px; overflow-x:auto; padding-bottom:6px; margin-bottom:12px; }
+  .tab{ flex-shrink:0; background:var(--bg-soft); border:1.5px solid var(--line); border-radius:999px; padding:8px 14px; font-weight:600; font-size:0.84rem; color:var(--ink-soft); cursor:pointer; }
+  .tab.on{ background:var(--blue); border-color:var(--blue); color:#fff; }
+  .card{ border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin-bottom:12px; }
+  .row{ display:flex; justify-content:space-between; align-items:flex-start; gap:10px; }
+  .oid{ font-size:0.76rem; color:var(--muted); font-weight:600; }
+  .chips{ display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
+  .chip{ font-size:0.72rem; font-weight:700; padding:3px 9px; border-radius:999px; background:var(--bg-soft); color:var(--ink-soft); }
+  .chip.paid{ background:#E7F6EC; color:var(--green); }
+  .chip.pending{ background:#FFF4DB; color:var(--amber); }
+  .chip.failed{ background:#FDE8E6; color:var(--red); }
+  .chip.delivered{ background:#E7F6EC; color:var(--green); }
+  .name{ font-weight:700; font-size:1.02rem; margin:8px 0 2px; }
+  .meta{ font-size:0.85rem; color:var(--ink-soft); line-height:1.6; }
+  .meta a{ color:var(--blue); text-decoration:none; font-weight:600; }
+  .items{ margin:10px 0; padding:10px 12px; background:var(--bg-soft); border-radius:8px; font-size:0.88rem; line-height:1.6; }
+  .money{ font-size:0.85rem; color:var(--ink-soft); margin-bottom:12px; }
+  .money b{ color:var(--ink); }
+  .actions{ display:flex; gap:8px; flex-wrap:wrap; }
+  .note{ font-size:0.78rem; color:var(--amber); margin:0 0 10px; }
+  .empty{ text-align:center; color:var(--muted); padding:40px 0; font-size:0.92rem; }
+  .hidden{ display:none; }
+</style>
+</head>
+<body>
+
+<div id="loginView" class="login hidden">
+  <h1>Raadeeye Nets</h1>
+  <p>Admin login</p>
+  <input id="pw" type="password" placeholder="Password" autocomplete="current-password">
+  <div class="err" id="loginErr"></div>
+  <button class="btn btn-primary" style="width:100%;margin-top:6px;" id="loginBtn">Log in</button>
+</div>
+
+<div id="appView" class="hidden">
+  <header><b>Orders</b><button id="logoutBtn">Log out</button></header>
+  <div class="wrap">
+    <div class="stats" id="stats"></div>
+    <div class="tabs" id="tabs"></div>
+    <div id="list"></div>
+  </div>
+</div>
+
+<script>
+  const $ = id => document.getElementById(id);
+  let token = localStorage.getItem('rn_admin_token') || '';
+  let filter = 'todo';
+  let timer = null;
+
+  // tiny DOM helper: all text goes through textContent, so customer input can't inject HTML
+  function h(tag, attrs, ...kids){
+    const el = document.createElement(tag);
+    for(const k in (attrs || {})){
+      if(k === 'class') el.className = attrs[k];
+      else if(k.startsWith('on')) el.addEventListener(k.slice(2), attrs[k]);
+      else el.setAttribute(k, attrs[k]);
+    }
+    kids.flat().forEach(c => { if(c != null && c !== false) el.append(c.nodeType ? c : document.createTextNode(c)); });
+    return el;
+  }
+  const money = n => '$' + Number(n).toFixed(2);
+
+  async function api(path, opts = {}){
+    const res = await fetch(path, {
+      ...opts,
+      headers: { 'Content-Type':'application/json', 'Authorization':'Bearer ' + token, ...(opts.headers || {}) }
+    });
+    if(res.status === 401){ logout(); throw new Error('Please log in again.'); }
+    const data = await res.json().catch(() => ({}));
+    if(!res.ok) throw new Error(data.error || 'Something went wrong.');
+    return data;
+  }
+
+  function show(view){
+    $('loginView').classList.toggle('hidden', view !== 'login');
+    $('appView').classList.toggle('hidden', view !== 'app');
+  }
+  function logout(){
+    token = ''; localStorage.removeItem('rn_admin_token');
+    clearInterval(timer); show('login');
+  }
+
+  $('loginBtn').onclick = async () => {
+    $('loginErr').textContent = '';
+    $('loginBtn').disabled = true;
+    try{
+      const res = await fetch('/admin/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ password: $('pw').value }) });
+      const data = await res.json().catch(() => ({}));
+      if(!res.ok) throw new Error(data.error || 'Login failed.');
+      token = data.token; localStorage.setItem('rn_admin_token', token);
+      $('pw').value = '';
+      start();
+    } catch(e){ $('loginErr').textContent = e.message; }
+    $('loginBtn').disabled = false;
+  };
+  $('pw').addEventListener('keydown', e => { if(e.key === 'Enter') $('loginBtn').click(); });
+  $('logoutBtn').onclick = logout;
+
+  const TABS = [['todo','To deliver'], ['pending','Unpaid'], ['delivered','Delivered'], ['all','All']];
+  function renderTabs(){
+    const box = $('tabs'); box.replaceChildren();
+    TABS.forEach(([id, label]) => box.append(h('button', { class:'tab' + (filter === id ? ' on' : ''), onclick: () => { filter = id; load(); } }, label)));
+  }
+
+  function waLink(phone){
+    let d = String(phone).replace(/\D/g, '');
+    if(d.length === 9) d = '252' + d;
+    return 'https://wa.me/' + d;
+  }
+  function when(iso){
+    return new Date(iso).toLocaleString('en-GB', { timeZone:'Africa/Mogadishu', day:'numeric', month:'short', hour:'2-digit', minute:'2-digit' });
+  }
+
+  function renderOrder(o){
+    const busy = btn => { btn.disabled = true; };
+    const actions = h('div', { class:'actions' });
+
+    if(o.payStatus === 'paid'){
+      if(o.deliveryStatus === 'delivered'){
+        actions.append(h('button', { class:'btn btn-ghost', onclick: async e => {
+          if(!confirm('Mark this order as NOT delivered?')) return;
+          busy(e.target); try{ await api('/admin/api/orders/' + o.id + '/delivered', { method:'POST', body: JSON.stringify({ delivered:false }) }); load(); }catch(err){ alert(err.message); load(); }
+        } }, 'Undo delivered'));
+      } else {
+        actions.append(h('button', { class:'btn btn-ok', onclick: async e => {
+          busy(e.target); try{ await api('/admin/api/orders/' + o.id + '/delivered', { method:'POST', body: JSON.stringify({ delivered:true }) }); load(); }catch(err){ alert(err.message); load(); }
+        } }, '✓ Mark delivered'));
+      }
+    } else if(o.sid){
+      actions.append(h('button', { class:'btn btn-primary', onclick: async e => {
+        busy(e.target); try{ await api('/admin/api/orders/' + o.id + '/recheck', { method:'POST' }); load(); }catch(err){ alert(err.message); load(); }
+      } }, 'Re-check payment'));
+    }
+    actions.append(h('a', { class:'btn btn-ghost', href: waLink(o.phone), target:'_blank', rel:'noopener', style:'text-decoration:none;display:inline-block;' }, 'WhatsApp'));
+
+    return h('div', { class:'card' },
+      h('div', { class:'row' },
+        h('span', { class:'oid' }, '#' + o.id + ' · ' + when(o.createdAt)),
+        h('div', { class:'chips' },
+          h('span', { class:'chip ' + o.payStatus }, o.payStatus === 'paid' ? 'Paid' : o.payStatus === 'failed' ? 'Failed' : 'Pending'),
+          o.payStatus === 'paid' ? h('span', { class:'chip ' + (o.deliveryStatus === 'delivered' ? 'delivered' : '') }, o.deliveryStatus === 'delivered' ? 'Delivered' : 'To deliver') : null
+        )
+      ),
+      h('div', { class:'name' }, o.name),
+      h('div', { class:'meta' },
+        h('a', { href:'tel:' + o.phone }, o.phone), ' · ', o.email, h('br'),
+        'To: ', h('b', {}, o.city + ', ' + o.region)
+      ),
+      h('div', { class:'items' }, o.items.map(i => h('div', {}, i.qty + ' × ' + i.title))),
+      h('div', { class:'money' }, 'Books ', h('b', {}, money(o.booksTotal)), ' + delivery ', h('b', {}, money(o.deliveryFee)), ' = ', h('b', {}, money(o.total))),
+      o.payStatus !== 'paid' && o.payMessage ? h('p', { class:'note' }, o.payMessage) : null,
+      actions
+    );
+  }
+
+  async function load(){
+    renderTabs();
+    try{
+      const data = await api('/admin/api/orders?filter=' + filter);
+      const s = data.summary;
+      $('stats').replaceChildren(
+        h('div', { class:'stat' }, h('b', {}, String(s.toDeliver)), h('span', {}, 'orders to deliver')),
+        h('div', { class:'stat' }, h('b', {}, String(s.deliveredShown) + '+'), h('span', {}, 'books delivered (shown on store)')),
+        h('div', { class:'stat' }, h('b', {}, money(s.revenue)), h('span', {}, 'paid in total')),
+        h('div', { class:'stat' }, h('b', {}, String(s.unpaid)), h('span', {}, 'unpaid / unclear'))
+      );
+      const list = $('list'); list.replaceChildren();
+      if(!data.orders.length) list.append(h('div', { class:'empty' }, 'No orders here yet.'));
+      data.orders.forEach(o => list.append(renderOrder(o)));
+    } catch(e){
+      if(token) $('list').replaceChildren(h('div', { class:'empty' }, e.message));
+    }
+  }
+
+  function start(){
+    show('app'); load();
+    clearInterval(timer); timer = setInterval(load, 60000);
+  }
+  if(token) start(); else show('login');
+</script>
+</body>
+</html>
