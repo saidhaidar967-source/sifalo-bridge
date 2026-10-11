@@ -79,11 +79,25 @@ if (pool) {
   pool.on('error', err => console.error('Database connection error (ignored, pool will reconnect):', err.message));
 }
 
+// Safe summary of where DATABASE_URL points (host and port only, never the password).
+function dbTarget() {
+  if (!DATABASE_URL) return { error: 'DATABASE_URL is not set' };
+  try {
+    const u = new URL(DATABASE_URL);
+    if (!u.hostname) return { error: 'DATABASE_URL has no host name after the @ - paste the FULL address from Railway' };
+    return { host: u.hostname, port: u.port || '5432' };
+  } catch (e) {
+    return { error: 'DATABASE_URL is not a valid address - it should start with postgresql:// and contain @host:port/database' };
+  }
+}
+
 let dbReady = false;
 let dbError = DATABASE_URL ? 'starting' : 'DATABASE_URL is not set';
 
 async function initDb() {
   if (!pool) throw new Error('DATABASE_URL is not set');
+  const t = dbTarget();
+  if (t.error) throw new Error(t.error);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS orders (
       id              TEXT PRIMARY KEY,
@@ -476,7 +490,13 @@ app.get('/', (req, res) => res.send('Raadeeye Nets order server is running.'));
 
 // Quick check from a phone browser: is the database connected?
 app.get('/health', (req, res) => {
-  res.json({ server: 'ok', database: dbReady ? 'ok' : 'not connected', detail: dbReady ? null : dbError });
+  const t = dbTarget();
+  res.json({
+    server: 'ok',
+    database: dbReady ? 'ok' : 'not connected',
+    trying: t.error ? null : `${t.host}:${t.port}`,
+    detail: dbReady ? null : dbError
+  });
 });
 
 async function connectDbWithRetry() {
