@@ -30,7 +30,7 @@ const DELIVERED_START = parseInt(DELIVERED_BASE, 10) || 0;
 // Catalogue + delivery rules (the server is the only source of prices)
 // ------------------------------------------------------------------
 const PRODUCTS = {
-  book:   { name: 'Siraha Ganacsi Ee Aan Laguu Sheegin',              price: '9.50' },
+  book:   { name: 'Siraha Ganacsi Ee Aan Laguu Sheegin',              price: '0.10' },
   guusha: { name: 'Guusha Ganacsigaaga',                              price: '6.70' },
   billow: { name: 'Sidee Loo Billaabaa Loona Badbaadiyaa Ganacsi?',   price: '9.00' },
   shayddaanka: { name: 'Shayddaanka & Aadanaha',                       price: '7.90' },
@@ -52,7 +52,7 @@ const REGIONS = {
   jubbaland:    'Jubbaland'
 };
 
-// Mogadishu: 1 book $1.50, 2+ books $2.00
+// Mogadishu: 1 book $0.10, 2+ books $2.00
 // Everywhere else: 1 book $2, 2 books $3, 3+ books $5
 function deliveryFeeCents(regionId, books) {
   if (regionId === 'benadir') return books <= 1 ? 150 : 200;
