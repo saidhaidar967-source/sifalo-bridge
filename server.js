@@ -30,9 +30,15 @@ const DELIVERED_START = parseInt(DELIVERED_BASE, 10) || 0;
 // Catalogue + delivery rules (the server is the only source of prices)
 // ------------------------------------------------------------------
 const PRODUCTS = {
-  book:   { name: 'Siraha Ganacsi Ee Aan Laguu Sheegin',              price: '4.99' },
-  guusha: { name: 'Guusha Ganacsigaaga',                              price: '3.50' },
-  billow: { name: 'Sidee Loo Billaabaa Loona Badbaadiyaa Ganacsi?',   price: '4.70' }
+  book:   { name: 'Siraha Ganacsi Ee Aan Laguu Sheegin',              price: '9.50' },
+  guusha: { name: 'Guusha Ganacsigaaga',                              price: '6.70' },
+  billow: { name: 'Sidee Loo Billaabaa Loona Badbaadiyaa Ganacsi?',   price: '9.00' },
+  shayddaanka: { name: 'Shayddaanka & Aadanaha',                       price: '7.90' },
+  jacaylka:    { name: 'Jacaylka Alle',                                price: '6.50' },
+  raadka:      { name: 'Raadkii Rasuulka',                             price: '9.50' },
+  lajirka:     { name: 'La Jirka Suubbanaha',                          price: '9.00' },
+  abaallaawe:  { name: 'Abaallaawe',                                   price: '8.50' },
+  xalaasha:    { name: 'Xalaasha Ayaa Inoo Ballan Ah',                 price: '10.00' }
 };
 
 const REGIONS = {
@@ -47,12 +53,12 @@ const REGIONS = {
 };
 
 // Mogadishu: 1 book $1.50, 2+ books $2.00
-// Everywhere else: 1 book $4, 2 books $7, 3+ books $10
+// Everywhere else: 1 book $2, 2 books $3, 3+ books $5
 function deliveryFeeCents(regionId, books) {
   if (regionId === 'benadir') return books <= 1 ? 150 : 200;
-  if (books <= 1) return 400;
-  if (books === 2) return 700;
-  return 1000;
+  if (books <= 1) return 200;
+  if (books === 2) return 300;
+  return 500;
 }
 const dollars = cents => (cents / 100).toFixed(2);
 
