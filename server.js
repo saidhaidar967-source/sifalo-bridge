@@ -52,7 +52,7 @@ const REGIONS = {
   jubbaland:    'Jubbaland'
 };
 
-// Mogadishu: 1 book $0.00, 2+ books $2.00
+// Mogadishu: 1 book $0.10, 2+ books $2.00
 // Everywhere else: 1 book $2, 2 books $3, 3+ books $5
 function deliveryFeeCents(regionId, books) {
   if (regionId === 'benadir') return books <= 1 ? 150 : 200;
