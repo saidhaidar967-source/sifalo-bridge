@@ -74,6 +74,14 @@ const pool = DATABASE_URL
     })
   : null;
 
+if (pool) {
+  // Without this listener, a dropped idle connection crashes the whole server.
+  pool.on('error', err => console.error('Database connection error (ignored, pool will reconnect):', err.message));
+}
+
+let dbReady = false;
+let dbError = DATABASE_URL ? 'starting' : 'DATABASE_URL is not set';
+
 async function initDb() {
   if (!pool) throw new Error('DATABASE_URL is not set');
   await pool.query(`
@@ -466,15 +474,33 @@ app.post('/admin/api/orders/:id/recheck', requireAdmin, async (req, res) => {
 
 app.get('/', (req, res) => res.send('Raadeeye Nets order server is running.'));
 
+// Quick check from a phone browser: is the database connected?
+app.get('/health', (req, res) => {
+  res.json({ server: 'ok', database: dbReady ? 'ok' : 'not connected', detail: dbReady ? null : dbError });
+});
+
+async function connectDbWithRetry() {
+  for (;;) {
+    try {
+      await initDb();
+      dbReady = true;
+      dbError = '';
+      console.log('Database ready');
+      return;
+    } catch (err) {
+      dbError = err.message;
+      console.error('Database setup failed, retrying in 10s:', err.message);
+      await new Promise(r => setTimeout(r, 10000));
+    }
+  }
+}
+
+process.on('unhandledRejection', err => console.error('Unhandled rejection:', err));
+process.on('uncaughtException', err => console.error('Uncaught exception:', err));
+
 if (require.main === module) {
-  initDb()
-    .then(() => {
-      app.listen(PORT, () => console.log(`Order server running on port ${PORT}`));
-    })
-    .catch(err => {
-      console.error('Startup failed:', err.message);
-      process.exit(1);
-    });
+  app.listen(PORT, () => console.log(`Order server running on port ${PORT}`));
+  if (pool) connectDbWithRetry();
 }
 
 module.exports = { app, deliveryFeeCents, resolveRegionId, handleOrder };
