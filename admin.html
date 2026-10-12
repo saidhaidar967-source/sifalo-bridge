@@ -95,6 +95,25 @@
   .mini tr.link{ cursor:pointer; }
   .mini tr.link:hover{ background:var(--hover); }
 
+  /* content editors */
+  .drawer.wide{ width:min(680px,100%); }
+  .fld{ display:block; margin:0 0 12px; }
+  .fld > span{ display:block; font-size:0.76rem; font-weight:700; color:var(--ink-soft); margin-bottom:4px; }
+  .fld input[type=text], .fld input[type=number], .fld textarea{ width:100%; padding:9px 10px; border:1.5px solid var(--line); border-radius:8px; }
+  .fld input:focus, .fld textarea:focus{ outline:none; border-color:var(--blue); }
+  .fgrid{ display:grid; grid-template-columns:1fr 1fr; gap:0 12px; }
+  .hint{ font-size:0.76rem; color:var(--muted); margin:-6px 0 12px; }
+  .thumb{ width:38px; height:53px; object-fit:cover; border-radius:4px; border:1px solid var(--grid); display:block; background:var(--bg-soft); }
+  .coverprev{ width:120px; height:168px; object-fit:cover; border-radius:6px; border:1px solid var(--grid); background:var(--bg-soft); display:block; margin-bottom:8px; }
+  .sect{ border:1px solid var(--grid); border-radius:10px; padding:14px 16px; margin-bottom:14px; max-width:820px; }
+  .sect h3{ margin:0 0 10px; font-size:0.98rem; }
+  .li{ border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:8px; background:var(--zebra); }
+  .li .tools{ display:flex; gap:6px; justify-content:flex-end; margin-bottom:6px; }
+  .li .tools button{ background:#fff; border:1px solid var(--line); border-radius:6px; cursor:pointer; padding:2px 8px; font-size:0.8rem; }
+  .savebar{ position:sticky; bottom:0; background:#fff; border-top:1px solid var(--line); padding:10px 0; display:flex; gap:12px; align-items:center; max-width:820px; }
+  .ok{ color:var(--green); font-weight:700; font-size:0.85rem; }
+  .bad{ color:var(--red); font-weight:700; font-size:0.85rem; }
+
   /* reports */
   .reports{ display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:14px; }
   .panel{ border:1px solid var(--grid); border-radius:10px; padding:12px 14px; }
@@ -129,6 +148,7 @@
 
 <div id="shade" class="shade hidden"></div>
 <div id="drawer" class="drawer hidden"></div>
+<div id="editor" class="drawer wide hidden"></div>
 
 <script>
   const $ = id => document.getElementById(id);
@@ -525,10 +545,198 @@
     d.classList.remove('hidden'); $('shade').classList.remove('hidden');
   }
 
+
+  /* ---------------- content: books ---------------- */
+  let books = null;
+  async function loadBooks(){ books = (await api('/admin/api/books')).books; }
+  const editor = () => $('editor');
+  function closeEditor(){ editor().classList.add('hidden'); if($('drawer').classList.contains('hidden')) $('shade').classList.add('hidden'); }
+  $('shade').addEventListener('click', closeEditor);
+
+  async function moveBook(i, dir){
+    const j = i + dir; if(j < 0 || j >= books.length) return;
+    [books[i], books[j]] = [books[j], books[i]];
+    renderMain();
+    try{ await api('/admin/api/books-order', { method:'POST', body: JSON.stringify({ ids: books.map(b => b.id) }) }); }
+    catch(e){ alert(e.message); }
+    await loadBooks(); renderMain();
+  }
+
+  function renderBooksView(root){
+    if(books == null){
+      root.append(h('div', { class:'empty' }, 'Loading books…'));
+      loadBooks().then(() => { if(view === 'books') renderMain(); }).catch(e => { if(view === 'books') $('main').replaceChildren(h('div', { class:'empty' }, e.message)); });
+      return;
+    }
+    root.append(h('div', { class:'bar' },
+      h('button', { class:'btn btn-primary', onclick: () => openBookEditor(null) }, '+ Add book'),
+      h('span', { class:'upd' }, 'Changes appear on the store and in checkout as soon as you save. Use ↑ ↓ to change the order on the shelf.'),
+      h('span', { class:'count' }, books.length + ' book' + (books.length === 1 ? '' : 's'))));
+    if(!books.length){ root.append(h('div', { class:'empty' }, 'No books yet. If you expected your 9 books here, upload seed.json next to server.js on Railway and redeploy, or add them with “+ Add book”.')); return; }
+    const thead = h('thead', {}, h('tr', {}, ['Order', 'Cover', 'Title', 'Author', 'Category', 'Price', 'On store', 'Sample PDF', ''].map(t => h('th', { style:'cursor:default' }, t))));
+    const tbody = h('tbody', {}, books.map((b, i) => h('tr', { onclick: () => openBookEditor(b) },
+      h('td', { onclick: e => e.stopPropagation(), style:'white-space:nowrap' },
+        h('button', { class:'btn btn-soft', style:'padding:3px 8px', disabled: i === 0 ? 'disabled' : null, onclick: () => moveBook(i, -1) }, '↑'), ' ',
+        h('button', { class:'btn btn-soft', style:'padding:3px 8px', disabled: i === books.length - 1 ? 'disabled' : null, onclick: () => moveBook(i, 1) }, '↓')),
+      h('td', {}, b.coverUrl ? h('img', { class:'thumb', src:b.coverUrl, alt:'' }) : h('div', { class:'thumb' })),
+      h('td', { title:b.title }, b.title), h('td', {}, b.author), h('td', {}, b.category),
+      h('td', { class:'num' }, money(b.price)),
+      h('td', {}, h('span', { class:'tag ' + (b.visible ? 'paid' : 'failed') }, b.visible ? 'Visible' : 'Hidden')),
+      h('td', {}, b.hasSample ? h('span', { class:'tag paid' }, 'Yes') : '—'),
+      h('td', {}, h('button', { class:'btn btn-ghost', style:'padding:4px 10px' }, 'Edit')))));
+    root.append(h('div', { class:'gridwrap' }, h('table', {}, thead, tbody)));
+  }
+
+  // shrink big photos in the browser before upload (max 1000px, JPEG)
+  function fileToCover(file){
+    return new Promise((resolve, reject) => {
+      if(!/^image\//.test(file.type)) return reject(new Error('Choose an image file (JPG, PNG or WebP).'));
+      const url = URL.createObjectURL(file); const img = new Image();
+      img.onload = () => {
+        const max = 1000, k = Math.min(1, max / Math.max(img.width, img.height));
+        const c = document.createElement('canvas'); c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+        const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); g.drawImage(img, 0, 0, c.width, c.height);
+        URL.revokeObjectURL(url); resolve(c.toDataURL('image/jpeg', 0.88));
+      };
+      img.onerror = () => reject(new Error('Could not read that image.'));
+      img.src = url;
+    });
+  }
+  const fileToDataUrl = file => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(new Error('Could not read the file.')); r.readAsDataURL(file); });
+
+  function openBookEditor(b){
+    const isNew = !b;
+    const f = { title: b ? b.title : '', author: b ? b.author : '', meta: b ? b.meta : '', category: b ? b.category : (books[0] ? books[0].category : 'Business'),
+                price: b ? b.price : '', visible: b ? b.visible : true, info: b ? (b.info || []).join('\n\n') : '', cover:null, sample:null, sampleName:'', removeSample:false };
+    const cats = [...new Set(books.map(x => x.category))];
+    const msg = h('span', { class:'bad' });
+    const prev = h('img', { class:'coverprev', alt:'', src: b && b.coverUrl ? b.coverUrl : '' });
+    if(!(b && b.coverUrl)) prev.style.visibility = 'hidden';
+    const sampleNote = h('div', { class:'hint' }, b && b.hasSample ? 'Current sample: ' + (b.sampleName || 'uploaded') : 'No sample uploaded.');
+    const field = (label, key, attrs = {}) => h('label', { class:'fld' }, h('span', {}, label), h('input', { type:'text', value: String(f[key]), oninput: e => { f[key] = e.target.value; }, ...attrs }));
+
+    const saveBtn = h('button', { class:'btn btn-primary', onclick: async e => {
+      msg.textContent = ''; e.target.disabled = true;
+      try{
+        const payload = { title:f.title, author:f.author, meta:f.meta, category:f.category, price:f.price, visible:f.visible,
+          info: f.info.split(/\n\s*\n/).map(x => x.trim()).filter(Boolean), cover:f.cover || undefined,
+          sample:f.sample || undefined, sampleName:f.sampleName || undefined, removeSample:f.removeSample };
+        if(isNew) await api('/admin/api/books', { method:'POST', body: JSON.stringify(payload) });
+        else await api('/admin/api/books/' + encodeURIComponent(b.id), { method:'PUT', body: JSON.stringify(payload) });
+        await loadBooks(); closeEditor(); renderMain();
+      } catch(err){ msg.textContent = err.message; e.target.disabled = false; }
+    } }, isNew ? 'Add book' : 'Save changes');
+
+    const ed = editor(); ed.replaceChildren(
+      h('button', { class:'x', onclick: closeEditor }, '×'),
+      h('h2', {}, isNew ? 'Add a book' : 'Edit book'),
+      h('div', { class:'sub' }, isNew ? 'It appears on the store when you press “Add book”.' : 'Saved changes go live on the store immediately.'),
+      field('Title', 'title'),
+      h('div', { class:'fgrid' }, field('Author (used for search)', 'author'), field('Price in US dollars (e.g. 9.50)', 'price', { type:'number', step:'0.01', min:'0' })),
+      h('div', { class:'fgrid' },
+        h('label', { class:'fld' }, h('span', {}, 'Category (the group heading on the store)'), h('input', { type:'text', list:'catlist', value:f.category, oninput: e => { f.category = e.target.value; } })),
+        field('Line under the title (e.g. Buug • 128 bog)', 'meta')),
+      h('datalist', { id:'catlist' }, cats.map(c => h('option', { value:c }))),
+      h('label', { class:'fld' }, h('span', {}, 'More Info text'), h('textarea', { style:'min-height:220px', oninput: e => { f.info = e.target.value; } }, f.info)),
+      h('div', { class:'hint' }, 'Leave a blank line between paragraphs.'),
+      h('div', { class:'fld' }, h('span', {}, 'Cover image'), prev,
+        h('input', { type:'file', accept:'image/*', onchange: async e => {
+          const file = e.target.files[0]; if(!file) return;
+          try{ f.cover = await fileToCover(file); prev.src = f.cover; prev.style.visibility = 'visible'; msg.textContent = ''; } catch(err){ msg.textContent = err.message; }
+        } }), h('div', { class:'hint', style:'margin-top:6px' }, 'Tall covers look best (about 5:7). Big photos are shrunk automatically.')),
+      h('div', { class:'fld' }, h('span', {}, 'Free sample PDF (optional)'), sampleNote,
+        h('input', { type:'file', accept:'application/pdf', onchange: async e => {
+          const file = e.target.files[0]; if(!file) return;
+          if(file.size > 8 * 1024 * 1024){ msg.textContent = 'The PDF is over 8 MB. Make it smaller (for example the first 20 pages only).'; e.target.value = ''; return; }
+          try{ f.sample = await fileToDataUrl(file); f.sampleName = file.name.replace(/\.pdf$/i, ''); f.removeSample = false; msg.textContent = ''; sampleNote.textContent = 'Will upload: ' + file.name; } catch(err){ msg.textContent = err.message; }
+        } }),
+        b && b.hasSample ? h('label', { style:'display:block;margin-top:6px;font-size:0.84rem' }, h('input', { type:'checkbox', onchange: e => { f.removeSample = e.target.checked; } }), ' Remove the current sample') : null),
+      h('label', { style:'display:flex;gap:8px;align-items:center;margin:6px 0 14px;font-weight:600' },
+        h('input', { type:'checkbox', checked:f.visible, onchange: e => { f.visible = e.target.checked; } }), 'Show this book on the store'),
+      h('div', { class:'acts' }, saveBtn, h('button', { class:'btn btn-soft', onclick: closeEditor }, 'Cancel'),
+        isNew ? null : h('button', { class:'btn btn-ghost', style:'border-color:var(--red);color:var(--red);margin-left:auto', onclick: async e => {
+          if(!confirm('Delete “' + b.title + '” for good? Past orders keep their record. To only hide it, untick “Show this book on the store” instead.')) return;
+          e.target.disabled = true;
+          try{ await api('/admin/api/books/' + encodeURIComponent(b.id), { method:'DELETE' }); await loadBooks(); closeEditor(); renderMain(); } catch(err){ msg.textContent = err.message; e.target.disabled = false; }
+        } }, 'Delete')),
+      msg);
+    ed.classList.remove('hidden'); $('shade').classList.remove('hidden'); ed.scrollTop = 0;
+  }
+
+  /* ---------------- content: page texts + delivery ---------------- */
+  let settings = null;      // { texts, delivery }
+  async function loadSettings(){ settings = await api('/admin/api/settings'); }
+  function tfield(label, obj, key, o = {}){
+    const input = o.multi ? h('textarea', { style:'min-height:' + (o.rows || 90) + 'px', oninput: e => { obj[key] = e.target.value; } }, obj[key] || '')
+                          : h('input', { type:'text', value: obj[key] || '', oninput: e => { obj[key] = e.target.value; } });
+    return h('label', { class:'fld' }, h('span', {}, label), input);
+  }
+  function listBlock(title, arr, makeItem, blank, hint){
+    const move = (i, d) => { const j = i + d; if(j < 0 || j >= arr.length) return; [arr[i], arr[j]] = [arr[j], arr[i]]; renderMain(); };
+    return h('div', { class:'sect' }, h('h3', {}, title), hint ? h('div', { class:'hint' }, hint) : null,
+      arr.map((it, i) => h('div', { class:'li' },
+        h('div', { class:'tools' }, h('button', { onclick: () => move(i, -1) }, '↑'), h('button', { onclick: () => move(i, 1) }, '↓'),
+          h('button', { style:'color:var(--red)', onclick: () => { if(confirm('Remove this item?')){ arr.splice(i, 1); renderMain(); } } }, 'Remove')),
+        makeItem(it, i))),
+      h('button', { class:'btn btn-soft', onclick: () => { arr.push(blank()); renderMain(); } }, '+ Add'));
+  }
+  function saveBar(label, fn){
+    const msg = h('span', {});
+    return h('div', { class:'savebar' }, h('button', { class:'btn btn-primary', onclick: async e => {
+      e.target.disabled = true; msg.className = ''; msg.textContent = 'Saving…';
+      try{ await fn(); msg.className = 'ok'; msg.textContent = 'Saved ✓ — live on the store'; } catch(err){ msg.className = 'bad'; msg.textContent = err.message; }
+      e.target.disabled = false;
+    } }, label), msg);
+  }
+
+  function renderTextsView(root){
+    if(settings == null){
+      root.append(h('div', { class:'empty' }, 'Loading…'));
+      loadSettings().then(() => { if(view === 'texts' || view === 'delivery') renderMain(); }).catch(e => { $('main').replaceChildren(h('div', { class:'empty' }, e.message)); });
+      return;
+    }
+    const t = settings.texts;
+    if(!t){ root.append(h('div', { class:'empty' }, 'The starter page texts were not loaded. Upload seed.json next to server.js on Railway and redeploy, then reopen this tab.')); return; }
+    ['introParas','guaranteeBullets','messages','testimonials','faqs'].forEach(k => { if(!Array.isArray(t[k])) t[k] = []; });
+    const sect = (title, ...kids) => h('div', { class:'sect' }, h('h3', {}, title), kids);
+    root.append(
+      h('p', { class:'upd', style:'margin:0 0 12px' }, 'Edit the words on the store. Press “Save page texts” at the bottom when you are done. An empty box shows nothing on the store, so keep boxes filled.'),
+      sect('Top of the page', tfield('Small tag line', t, 'heroTag'), tfield('Main headline', t, 'heroTitle'), tfield('Intro text', t, 'heroText', { multi:true })),
+      sect('Books section', tfield('Sub-heading under “Available Now”', t, 'shelfSub')),
+      sect('Hordhac', tfield('Sub-heading', t, 'introSub')),
+      listBlock('Hordhac paragraphs', t.introParas, (it, i) => h('textarea', { style:'width:100%;min-height:90px;padding:9px;border:1.5px solid var(--line);border-radius:8px', oninput: e => { t.introParas[i] = e.target.value; } }, it), () => ''),
+      sect('Testimonials heading', tfield('Sub-heading', t, 'testiSub')),
+      listBlock('Testimonials', t.testimonials, (it) => h('div', {}, tfield('What they said', it, 'text', { multi:true }), tfield('Name and place (e.g. Ali Osman, Hargaysa)', it, 'name')), () => ({ text:'', name:'' })),
+      sect('Big quote', tfield('Quote', t, 'pqText', { multi:true }), tfield('Who said it', t, 'pqAuthor')),
+      listBlock('Customer messages (the sliding cards)', t.messages, (it, i) => h('textarea', { style:'width:100%;min-height:60px;padding:9px;border:1.5px solid var(--line);border-radius:8px', oninput: e => { t.messages[i] = e.target.value; } }, it), () => ''),
+      sect('Guarantee / Dammaanad', tfield('Headline', t, 'guaranteeHeadline', { multi:true, rows:60 }), tfield('WhatsApp button text', t, 'guaranteeButton')),
+      listBlock('Guarantee bullet points', t.guaranteeBullets, (it, i) => h('textarea', { style:'width:100%;min-height:70px;padding:9px;border:1.5px solid var(--line);border-radius:8px', oninput: e => { t.guaranteeBullets[i] = e.target.value; } }, it), () => ''),
+      sect('FAQ heading', tfield('Sub-heading', t, 'faqSub')),
+      listBlock('FAQ questions', t.faqs, (it) => h('div', {}, tfield('Question', it, 'q'), tfield('Answer (blank line = new paragraph)', it, 'a', { multi:true, rows:120 })), () => ({ q:'', a:'' })),
+      sect('Bottom call-to-action', tfield('Small line above', t, 'ctaEyebrow'), tfield('Heading', t, 'ctaHeading'), tfield('Text', t, 'ctaSub', { multi:true, rows:70 }), tfield('Button text', t, 'ctaButton')),
+      sect('WhatsApp contact', tfield('WhatsApp number (digits only, with country code, e.g. 252613687974)', t, 'whatsapp'), tfield('How the number is shown to customers', t, 'whatsappDisplay')),
+      saveBar('Save page texts', async () => { await api('/admin/api/settings', { method:'PUT', body: JSON.stringify({ texts:t }) }); await loadSettings(); })
+    );
+  }
+
+  function renderDeliveryView(root){
+    if(settings == null){ renderTextsView(root); return; }
+    const d = settings.delivery;
+    const num = (label, key) => h('label', { class:'fld' }, h('span', {}, label), h('input', { type:'number', step:'0.01', min:'0', value:String(d[key]), oninput: e => { d[key] = e.target.value; } }));
+    root.append(
+      h('p', { class:'upd', style:'margin:0 0 12px' }, 'These fees are used both on the store and when customers are charged, so they always match. Amounts are in US dollars.'),
+      h('div', { class:'sect' }, h('h3', {}, 'Benadir / Mogadishu'), h('div', { class:'fgrid' }, num('1 book', 'benadir1'), num('2 or more books', 'benadir2')),
+        h('label', { class:'fld' }, h('span', {}, 'Delivery time shown'), h('input', { type:'text', value:d.timeMog, oninput: e => { d.timeMog = e.target.value; } }))),
+      h('div', { class:'sect' }, h('h3', {}, 'All other regions'), h('div', { class:'fgrid' }, num('1 book', 'other1'), num('2 books', 'other2')), h('div', { class:'fgrid' }, num('3 or more books', 'other3'), h('span', {})),
+        h('label', { class:'fld' }, h('span', {}, 'Delivery time shown'), h('input', { type:'text', value:d.timeOther, oninput: e => { d.timeOther = e.target.value; } }))),
+      saveBar('Save delivery fees', async () => { await api('/admin/api/settings', { method:'PUT', body: JSON.stringify({ delivery:d }) }); await loadSettings(); })
+    );
+  }
+
   /* ---------------- main ---------------- */
-  const NAV = [['orders','Orders'], ['customers','Customers'], ['reports','Reports']];
+  const NAV = [['orders','Orders'], ['customers','Customers'], ['reports','Reports'], ['books','Books'], ['texts','Page texts'], ['delivery','Delivery fees']];
   function renderNav(){
-    $('nav').replaceChildren(...NAV.map(([id, label]) => h('button', { class: view === id ? 'on' : '', onclick: () => { view = id; closeDrawer(); renderNav(); renderMain(); } }, label)));
+    $('nav').replaceChildren(...NAV.map(([id, label]) => h('button', { class: view === id ? 'on' : '', onclick: () => { view = id; closeDrawer(); closeEditor(); if(id === 'books') books = null; if(id === 'texts' || id === 'delivery') settings = null; renderNav(); renderMain(); } }, label)));
   }
   function renderStats(){
     const paid = orders.filter(isPaid);
@@ -548,7 +756,10 @@
     const root = $('main'); root.replaceChildren();
     if(view === 'orders') renderOrders(root);
     else if(view === 'customers') renderCustomers(root);
-    else renderReports(root);
+    else if(view === 'reports') renderReports(root);
+    else if(view === 'books') renderBooksView(root);
+    else if(view === 'texts') renderTextsView(root);
+    else renderDeliveryView(root);
     const gw = document.querySelector('.gridwrap');
     if(st && gw){ gw.scrollTop = st[0]; gw.scrollLeft = st[1]; }
   }
@@ -562,7 +773,8 @@
       orders = all.orders || [];
       if(sum && sum.summary) deliveredShown = sum.summary.deliveredShown;
       $('upd').textContent = 'Updated ' + new Date().toLocaleTimeString('en-GB', { timeZone:TZ, hour:'2-digit', minute:'2-digit' });
-      renderStats(); renderMain();
+      renderStats();
+      if(['orders','customers','reports'].includes(view)) renderMain();
       if(openId || openCustomer) renderDrawer();
     } catch(e){
       if(token) $('main').replaceChildren(h('div', { class:'empty' }, e.message));
