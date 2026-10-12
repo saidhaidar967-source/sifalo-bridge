@@ -9,7 +9,9 @@ const { Pool } = require('pg');
 
 const app = express();
 app.set('trust proxy', 1); // Railway sits behind a proxy
-app.use(express.json({ limit: '20kb' }));
+const jsonSmall = express.json({ limit: '20kb' });
+const jsonLarge = express.json({ limit: '16mb' });   // admin uploads (cover images, sample PDFs)
+app.use((req, res, next) => (req.path.startsWith('/admin/api/') ? jsonLarge : jsonSmall)(req, res, next));
 app.use(cors());
 
 const {
@@ -52,15 +54,28 @@ const REGIONS = {
   jubbaland:    'Jubbaland'
 };
 
-// Mogadishu: 1 book $1.50, 2+ books $2.00
-// Everywhere else: 1 book $2, 2 books $3, 3+ books $5
+// Delivery fees. The numbers below are only the defaults: once you save "Delivery fees"
+// in the admin page, the saved values are used instead (for the store AND for charging).
+let deliveryCfg = { benadir1: 1.5, benadir2: 2, other1: 2, other2: 3, other3: 5 };
 function deliveryFeeCents(regionId, books) {
-  if (regionId === 'benadir') return books <= 1 ? 150 : 200;
-  if (books <= 1) return 200;
-  if (books === 2) return 300;
-  return 500;
+  const d = deliveryCfg;
+  const usd = regionId === 'benadir'
+    ? (books <= 1 ? d.benadir1 : d.benadir2)
+    : (books <= 1 ? d.other1 : books === 2 ? d.other2 : d.other3);
+  return Math.round(usd * 100);
 }
 const dollars = cents => (cents / 100).toFixed(2);
+
+// Catalogue kept in memory, loaded from the database (books, page texts, delivery fees).
+// While the database has no books (or is down) the built-in PRODUCTS list above is used instead.
+let catalog = { books: [], texts: null, delivery: null, loadedAt: 0 };
+function getProduct(id) {
+  if (catalog.books.length) {
+    const b = catalog.books.find(x => x.id === id);
+    return b ? { name: b.title, price: Number(b.price).toFixed(2) } : null;
+  }
+  return Object.prototype.hasOwnProperty.call(PRODUCTS, id) ? PRODUCTS[id] : null;
+}
 
 const GATEWAY_MAP = {
   evc: 'waafi',
@@ -132,6 +147,29 @@ async function initDb() {
       client_ua       TEXT
     )`);
   await pool.query('CREATE INDEX IF NOT EXISTS orders_created_idx ON orders (created_at DESC)');
+  await pool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS notes TEXT');
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS books (
+      id          TEXT PRIMARY KEY,
+      title       TEXT NOT NULL,
+      author      TEXT NOT NULL DEFAULT '',
+      meta        TEXT NOT NULL DEFAULT '',
+      category    TEXT NOT NULL DEFAULT 'Books',
+      price       NUMERIC(10,2) NOT NULL,
+      visible     BOOLEAN NOT NULL DEFAULT TRUE,
+      position    INTEGER NOT NULL DEFAULT 0,
+      info        JSONB NOT NULL DEFAULT '[]',
+      cover       BYTEA,
+      cover_mime  TEXT,
+      cover_v     INTEGER NOT NULL DEFAULT 1,
+      sample      BYTEA,
+      sample_name TEXT,
+      sample_v    INTEGER NOT NULL DEFAULT 1,
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())');
+  await seedIfEmpty();
+  await refreshCatalog();
 }
 
 function mapOrder(r) {
@@ -154,7 +192,8 @@ function mapOrder(r) {
     payMessage: r.pay_message,
     paidAt: r.paid_at,
     deliveryStatus: r.delivery_status,
-    deliveredAt: r.delivered_at
+    deliveredAt: r.delivered_at,
+    notes: r.notes || ''
   };
 }
 
@@ -222,6 +261,122 @@ async function markPaid(orderId, sid) {
 }
 
 // ------------------------------------------------------------------
+// Catalogue: books, page texts, delivery fees (edited in the admin page)
+// ------------------------------------------------------------------
+function parseDataUrl(u, allowed) {
+  const m = /^data:([a-z]+\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/i.exec(String(u || ''));
+  if (!m || !allowed.includes(m[1].toLowerCase())) return null;
+  return { mime: m[1].toLowerCase(), buf: Buffer.from(m[2].replace(/\s+/g, ''), 'base64') };
+}
+
+// First start only: copy the starter content (seed.json, next to this file) into the database.
+async function seedIfEmpty() {
+  let seed = null;
+  try { seed = JSON.parse(fs.readFileSync(path.join(__dirname, 'seed.json'), 'utf8')); }
+  catch (e) { console.log('No seed.json found - starting with an empty catalogue (the store keeps its built-in books).'); return; }
+
+  const n = (await pool.query('SELECT COUNT(*)::int AS n FROM books')).rows[0].n;
+  if (n === 0 && Array.isArray(seed.books)) {
+    for (const b of seed.books) {
+      const cover = parseDataUrl(b.cover, ['image/jpeg', 'image/png', 'image/webp']);
+      await pool.query(
+        `INSERT INTO books (id, title, author, meta, category, price, visible, position, info, cover, cover_mime)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
+        [b.id, b.title, b.author || '', b.meta || '', b.category || 'Books', b.price, b.visible !== false,
+         b.position || 0, JSON.stringify(b.info || []), cover ? cover.buf : null, cover ? cover.mime : null]);
+    }
+    console.log(`Seeded ${seed.books.length} books`);
+  }
+  for (const key of ['texts', 'delivery']) {
+    if (seed[key]) {
+      await pool.query('INSERT INTO settings (key, value) VALUES ($1,$2) ON CONFLICT (key) DO NOTHING', [key, JSON.stringify(seed[key])]);
+    }
+  }
+}
+
+function bookRowToPublic(r) {
+  return {
+    id: r.id, title: r.title, author: r.author, meta: r.meta, category: r.category,
+    price: Number(r.price), info: r.info || [],
+    cover: r.cover_mime ? `/books/${encodeURIComponent(r.id)}/cover?v=${r.cover_v}` : null,
+    sample: r.sample_name ? `/books/${encodeURIComponent(r.id)}/sample?v=${r.sample_v}` : null
+  };
+}
+
+async function refreshCatalog() {
+  if (!pool) return;
+  const books = await pool.query(
+    `SELECT id,title,author,meta,category,price,info,cover_mime,cover_v,sample_name,sample_v
+       FROM books WHERE visible ORDER BY position, title`);
+  const st = await pool.query('SELECT key, value FROM settings');
+  const settings = Object.fromEntries(st.rows.map(r => [r.key, r.value]));
+  if (settings.delivery) deliveryCfg = { ...deliveryCfg, ...cleanDelivery(settings.delivery, deliveryCfg) };
+  catalog = { books: books.rows.map(bookRowToPublic), texts: settings.texts || null, delivery: settings.delivery || null, loadedAt: Date.now() };
+}
+
+const money2 = v => { const x = Number(v); return Number.isFinite(x) && x >= 0 && x <= 1000 ? Math.round(x * 100) / 100 : null; };
+function cleanDelivery(d, base) {
+  const out = {};
+  for (const k of ['benadir1', 'benadir2', 'other1', 'other2', 'other3']) {
+    const v = money2(d && d[k]);
+    out[k] = v == null ? base[k] : v;
+  }
+  out.timeMog = clean(d && d.timeMog, 60) || 'within 24 hours';
+  out.timeOther = clean(d && d.timeOther, 60) || '2 to 3 days';
+  return out;
+}
+
+// Page texts: only known keys, strings are trimmed and length-limited, lists are size-limited.
+const TEXT_STRINGS = ['heroTag', 'heroTitle', 'heroText', 'shelfSub', 'introSub', 'testiSub', 'pqText', 'pqAuthor',
+  'guaranteeHeadline', 'guaranteeButton', 'faqSub', 'ctaEyebrow', 'ctaHeading', 'ctaSub', 'ctaButton', 'whatsapp', 'whatsappDisplay'];
+function cleanTexts(t) {
+  const out = {};
+  t = t || {};
+  for (const k of TEXT_STRINGS) if (typeof t[k] === 'string') out[k] = clean(t[k], 1500);
+  if (out.whatsapp != null) out.whatsapp = out.whatsapp.replace(/\D/g, '').slice(0, 20);
+  const list = (v, max, fn) => (Array.isArray(v) ? v.slice(0, max).map(fn).filter(Boolean) : undefined);
+  const put = (k, v) => { if (v !== undefined) out[k] = v; };
+  put('introParas', list(t.introParas, 30, p => clean(p, 3000) || null));
+  put('guaranteeBullets', list(t.guaranteeBullets, 12, p => clean(p, 1000) || null));
+  put('messages', list(t.messages, 40, p => clean(p, 500) || null));
+  put('testimonials', list(t.testimonials, 30, p => (p && clean(p.text, 1500)) ? { text: clean(p.text, 1500), name: clean(p.name, 200) } : null));
+  put('faqs', list(t.faqs, 40, p => (p && clean(p.q, 300)) ? { q: clean(p.q, 300), a: String(p.a || '').trim().slice(0, 5000) } : null));
+  return out;
+}
+
+const slugify = s => String(s || '').toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'book';
+
+app.get('/catalog', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({
+    books: catalog.books,
+    texts: catalog.texts,
+    delivery: catalog.delivery ? { ...deliveryCfg, timeMog: catalog.delivery.timeMog, timeOther: catalog.delivery.timeOther } : null
+  });
+});
+
+app.get('/books/:id/cover', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT cover, cover_mime FROM books WHERE id=$1', [req.params.id]);
+    if (!rows[0] || !rows[0].cover) return res.status(404).end();
+    res.set('Content-Type', rows[0].cover_mime);
+    res.set('Cache-Control', 'public, max-age=31536000, immutable');   // the ?v=N in the URL changes when the cover changes
+    res.send(rows[0].cover);
+  } catch (e) { res.status(500).end(); }
+});
+
+app.get('/books/:id/sample', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT sample, sample_name FROM books WHERE id=$1 AND visible', [req.params.id]);
+    if (!rows[0] || !rows[0].sample) return res.status(404).end();
+    res.set('Content-Type', 'application/pdf');
+    res.set('Content-Disposition', `attachment; filename="${slugify(rows[0].sample_name || req.params.id)}.pdf"`);
+    res.set('Cache-Control', 'public, max-age=300');
+    res.send(rows[0].sample);
+  } catch (e) { res.status(500).end(); }
+});
+
+// ------------------------------------------------------------------
 // Checkout: /pay (one book) and /pay-cart (several) share one handler
 // ------------------------------------------------------------------
 async function handleOrder(req, res, rawItems) {
@@ -243,9 +398,11 @@ async function handleOrder(req, res, rawItems) {
 
   // Merge duplicates, validate ids, recompute everything server-side.
   const merged = new Map();
+  const infos = new Map();
   for (const it of rawItems) {
-    const info = PRODUCTS[it && it.productId];
+    const info = getProduct(it && it.productId);
     if (!info) return res.status(400).json({ error: `Unknown product: ${it && it.productId}` });
+    infos.set(it.productId, info);
     const qty = Math.min(99, Math.max(1, parseInt(it.qty, 10) || 1));
     merged.set(it.productId, (merged.get(it.productId) || 0) + qty);
   }
@@ -253,8 +410,8 @@ async function handleOrder(req, res, rawItems) {
   let books = 0, booksCents = 0;
   for (const [productId, q] of merged) {
     const qty = Math.min(99, q);
-    const priceCents = Math.round(parseFloat(PRODUCTS[productId].price) * 100);
-    items.push({ productId, title: PRODUCTS[productId].name, price: priceCents / 100, qty });
+    const priceCents = Math.round(parseFloat(infos.get(productId).price) * 100);
+    items.push({ productId, title: infos.get(productId).name, price: priceCents / 100, qty });
     books += qty;
     booksCents += priceCents * qty;
   }
@@ -445,6 +602,151 @@ app.get('/admin/api/orders', requireAdmin, async (req, res) => {
   }
 });
 
+// ---- Admin: books -------------------------------------------------
+const bookRowToAdmin = r => ({
+  id: r.id, title: r.title, author: r.author, meta: r.meta, category: r.category, price: Number(r.price),
+  visible: r.visible, position: r.position, info: r.info || [],
+  hasCover: !!r.cover_mime, coverUrl: r.cover_mime ? `/books/${encodeURIComponent(r.id)}/cover?v=${r.cover_v}` : null,
+  hasSample: !!r.sample_name, sampleName: r.sample_name, sampleUrl: r.sample_name ? `/books/${encodeURIComponent(r.id)}/sample?v=${r.sample_v}` : null
+});
+const BOOK_COLS = 'id,title,author,meta,category,price,visible,position,info,cover_mime,cover_v,sample_name,sample_v';
+
+app.get('/admin/api/books', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT ${BOOK_COLS} FROM books ORDER BY position, title`);
+    res.json({ books: rows.map(bookRowToAdmin) });
+  } catch (err) { console.error('admin books failed:', err.message); res.status(500).json({ error: 'Could not load books.' }); }
+});
+
+function readBookBody(b, res, isNew) {
+  const title = clean(b.title, 200);
+  const price = money2(b.price);
+  if (!title) { res.status(400).json({ error: 'Enter the book title.' }); return null; }
+  if (price == null || price <= 0) { res.status(400).json({ error: 'Enter a price above 0 (for example 9.50).' }); return null; }
+  const out = {
+    title, price,
+    author: clean(b.author, 200), meta: clean(b.meta, 200), category: clean(b.category, 60) || 'Books',
+    visible: b.visible !== false,
+    info: (Array.isArray(b.info) ? b.info : []).slice(0, 20).map(p => String(p || '').trim().slice(0, 6000)).filter(Boolean)
+  };
+  if (b.cover) {
+    const c = parseDataUrl(b.cover, ['image/jpeg', 'image/png', 'image/webp']);
+    if (!c || c.buf.length > 3 * 1024 * 1024) { res.status(400).json({ error: 'The cover must be a JPG, PNG or WebP image under 3 MB.' }); return null; }
+    out.cover = c;
+  }
+  if (b.sample) {
+    const p = parseDataUrl(b.sample, ['application/pdf']);
+    if (!p || p.buf.length > 10 * 1024 * 1024 || p.buf.slice(0, 4).toString() !== '%PDF') { res.status(400).json({ error: 'The sample must be a PDF under 10 MB.' }); return null; }
+    out.sample = p.buf; out.sampleName = clean(b.sampleName, 150) || title;
+  }
+  out.removeSample = !!b.removeSample;
+  return out;
+}
+
+app.post('/admin/api/books', requireAdmin, async (req, res) => {
+  try {
+    const b = readBookBody(req.body || {}, res, true);
+    if (!b) return;
+    let id = slugify((req.body || {}).id || b.title);
+    const taken = new Set((await pool.query('SELECT id FROM books')).rows.map(r => r.id));
+    let base = id, i = 2; while (taken.has(id)) id = `${base}-${i++}`;
+    const pos = (await pool.query('SELECT COALESCE(MAX(position),-1)+1 AS p FROM books')).rows[0].p;
+    await pool.query(
+      `INSERT INTO books (id,title,author,meta,category,price,visible,position,info,cover,cover_mime,sample,sample_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [id, b.title, b.author, b.meta, b.category, b.price, b.visible, pos, JSON.stringify(b.info),
+       b.cover ? b.cover.buf : null, b.cover ? b.cover.mime : null, b.sample || null, b.sample ? b.sampleName : null]);
+    await refreshCatalog();
+    res.json({ id });
+  } catch (err) { console.error('admin book create failed:', err.message); res.status(500).json({ error: 'Could not save the book.' }); }
+});
+
+app.put('/admin/api/books/:id', requireAdmin, async (req, res) => {
+  try {
+    const b = readBookBody(req.body || {}, res, false);
+    if (!b) return;
+    const sets = ['title=$2','author=$3','meta=$4','category=$5','price=$6','visible=$7','info=$8','updated_at=now()'];
+    const vals = [req.params.id, b.title, b.author, b.meta, b.category, b.price, b.visible, JSON.stringify(b.info)];
+    if (b.cover) { vals.push(b.cover.buf, b.cover.mime); sets.push(`cover=$${vals.length - 1}`, `cover_mime=$${vals.length}`, 'cover_v=cover_v+1'); }
+    if (b.sample) { vals.push(b.sample, b.sampleName); sets.push(`sample=$${vals.length - 1}`, `sample_name=$${vals.length}`, 'sample_v=sample_v+1'); }
+    else if (b.removeSample) { sets.push('sample=NULL', 'sample_name=NULL', 'sample_v=sample_v+1'); }
+    const r = await pool.query(`UPDATE books SET ${sets.join(',')} WHERE id=$1`, vals);
+    if (!r.rowCount) return res.status(404).json({ error: 'Book not found.' });
+    await refreshCatalog();
+    res.json({ ok: true });
+  } catch (err) { console.error('admin book update failed:', err.message); res.status(500).json({ error: 'Could not save the book.' }); }
+});
+
+app.delete('/admin/api/books/:id', requireAdmin, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM books WHERE id=$1', [req.params.id]);
+    await refreshCatalog();
+    res.json({ ok: true });
+  } catch (err) { console.error('admin book delete failed:', err.message); res.status(500).json({ error: 'Could not delete the book.' }); }
+});
+
+app.post('/admin/api/books-order', requireAdmin, async (req, res) => {
+  try {
+    const ids = Array.isArray((req.body || {}).ids) ? req.body.ids.map(String).slice(0, 500) : [];
+    for (let i = 0; i < ids.length; i++) await pool.query('UPDATE books SET position=$2 WHERE id=$1', [ids[i], i]);
+    await refreshCatalog();
+    res.json({ ok: true });
+  } catch (err) { console.error('admin order failed:', err.message); res.status(500).json({ error: 'Could not save the order.' }); }
+});
+
+// ---- Admin: page texts + delivery fees ----------------------------
+app.get('/admin/api/settings', requireAdmin, async (req, res) => {
+  try {
+    const st = await pool.query('SELECT key, value FROM settings');
+    const s = Object.fromEntries(st.rows.map(r => [r.key, r.value]));
+    res.json({ texts: s.texts || null, delivery: { ...deliveryCfg, timeMog: (s.delivery && s.delivery.timeMog) || 'within 24 hours', timeOther: (s.delivery && s.delivery.timeOther) || '2 to 3 days' } });
+  } catch (err) { console.error('admin settings failed:', err.message); res.status(500).json({ error: 'Could not load settings.' }); }
+});
+
+app.put('/admin/api/settings', requireAdmin, async (req, res) => {
+  try {
+    const body = req.body || {};
+    if (body.texts) {
+      const t = cleanTexts(body.texts);
+      await pool.query(`INSERT INTO settings (key,value) VALUES ('texts',$1)
+                        ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=now()`, [JSON.stringify(t)]);
+    }
+    if (body.delivery) {
+      const d = cleanDelivery(body.delivery, deliveryCfg);
+      await pool.query(`INSERT INTO settings (key,value) VALUES ('delivery',$1)
+                        ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=now()`, [JSON.stringify(d)]);
+    }
+    await refreshCatalog();
+    res.json({ ok: true });
+  } catch (err) { console.error('admin settings save failed:', err.message); res.status(500).json({ error: 'Could not save.' }); }
+});
+
+// Admin page: every order in one go (the page filters, sorts and searches by itself).
+app.get('/admin/api/orders-all', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM orders ORDER BY created_at DESC LIMIT 5000');
+    res.json({ orders: rows.map(mapOrder) });
+  } catch (err) {
+    console.error('admin orders-all failed:', err.message);
+    res.status(500).json({ error: 'Could not load orders.' });
+  }
+});
+
+// Admin page: save a private note on an order.
+app.post('/admin/api/orders/:id/notes', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'UPDATE orders SET notes = $2 WHERE id = $1 RETURNING *',
+      [req.params.id, clean((req.body || {}).notes, 1000)]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Order not found.' });
+    res.json({ order: mapOrder(rows[0]) });
+  } catch (err) {
+    console.error('admin notes failed:', err.message);
+    res.status(500).json({ error: 'Could not save note.' });
+  }
+});
+
 app.post('/admin/api/orders/:id/delivered', requireAdmin, async (req, res) => {
   const delivered = !!(req.body || {}).delivered;
   try {
@@ -526,7 +828,7 @@ process.on('uncaughtException', err => console.error('Uncaught exception:', err)
 
 if (require.main === module) {
   app.listen(PORT, () => console.log(`Order server running on port ${PORT}`));
-  if (pool) connectDbWithRetry();
+  if (pool) { connectDbWithRetry(); setInterval(() => { if (dbReady) refreshCatalog().catch(() => {}); }, 5 * 60 * 1000); }
 }
 
 module.exports = { app, deliveryFeeCents, resolveRegionId, handleOrder };
