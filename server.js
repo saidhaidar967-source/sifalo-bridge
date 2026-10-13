@@ -56,11 +56,14 @@ const REGIONS = {
 
 // Delivery fees. The numbers below are only the defaults: once you save "Delivery fees"
 // in the admin page, the saved values are used instead (for the store AND for charging).
-// localRegions = the regions where you keep stock: customers there get the fast, cheaper "local" rates (benadir1/benadir2).
-let deliveryCfg = { benadir1: 1.5, benadir2: 2, other1: 2, other2: 3, other3: 5, localRegions: ['benadir', 'somaliland'] };
-function deliveryFeeCents(regionId, books) {
+// "Local" delivery (benadir1/benadir2, 24 hours): EVERY book in the order is kept in the region the customer chose.
+// Each book has its own "stock" list (set in the admin). Otherwise the "other" rates apply (other1/other2/other3).
+const STOCK_REGIONS = ['benadir', 'somaliland'];          // the two places where books are kept
+const DEFAULT_STOCK = ['benadir', 'somaliland'];
+let deliveryCfg = { benadir1: 1.5, benadir2: 2, other1: 2, other2: 3, other3: 5 };
+function deliveryFeeCents(regionId, books, local) {
   const d = deliveryCfg;
-  const usd = (d.localRegions || []).includes(regionId)
+  const usd = local
     ? (books <= 1 ? d.benadir1 : d.benadir2)
     : (books <= 1 ? d.other1 : books === 2 ? d.other2 : d.other3);
   return Math.round(usd * 100);
@@ -73,9 +76,9 @@ let catalog = { books: [], texts: null, delivery: null, loadedAt: 0 };
 function getProduct(id) {
   if (catalog.books.length) {
     const b = catalog.books.find(x => x.id === id);
-    return b ? { name: b.title, price: Number(b.price).toFixed(2) } : null;
+    return b ? { name: b.title, price: Number(b.price).toFixed(2), stock: b.stock } : null;
   }
-  return Object.prototype.hasOwnProperty.call(PRODUCTS, id) ? PRODUCTS[id] : null;
+  return Object.prototype.hasOwnProperty.call(PRODUCTS, id) ? { ...PRODUCTS[id], stock: DEFAULT_STOCK } : null;
 }
 
 const GATEWAY_MAP = {
@@ -171,6 +174,7 @@ async function initDb() {
     )`);
   await pool.query('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())');
   await pool.query('ALTER TABLE books ADD COLUMN IF NOT EXISTS rating NUMERIC(2,1)');
+  await pool.query(`ALTER TABLE books ADD COLUMN IF NOT EXISTS stock JSONB NOT NULL DEFAULT '["benadir","somaliland"]'::jsonb`);
   await seedIfEmpty();
   await pool.query('UPDATE books SET rating = 4.5 WHERE rating IS NULL');   // books without a rating yet
   // one time: move the three old category names to the new category list
@@ -314,6 +318,7 @@ function bookRowToPublic(r) {
   return {
     id: r.id, title: r.title, author: r.author, meta: r.meta, category: r.category,
     price: Number(r.price), rating: r.rating == null ? null : Number(r.rating), info: r.info || [],
+    stock: Array.isArray(r.stock) && r.stock.length ? r.stock : DEFAULT_STOCK,
     cover: r.cover_mime ? `/books/${encodeURIComponent(r.id)}/cover?v=${r.cover_v}` : null,
     sample: r.sample_name ? `/books/${encodeURIComponent(r.id)}/sample?v=${r.sample_v}` : null
   };
@@ -322,7 +327,7 @@ function bookRowToPublic(r) {
 async function refreshCatalog() {
   if (!pool) return;
   const books = await pool.query(
-    `SELECT id,title,author,meta,category,price,rating,info,cover_mime,cover_v,sample_name,sample_v
+    `SELECT id,title,author,meta,category,price,rating,stock,info,cover_mime,cover_v,sample_name,sample_v
        FROM books WHERE visible ORDER BY position, title`);
   const st = await pool.query('SELECT key, value FROM settings');
   const settings = Object.fromEntries(st.rows.map(r => [r.key, r.value]));
@@ -337,7 +342,6 @@ function cleanDelivery(d, base) {
     const v = money2(d && d[k]);
     out[k] = v == null ? base[k] : v;
   }
-  out.localRegions = Array.isArray(d && d.localRegions) ? [...new Set(d.localRegions.map(String))].filter(id => Object.prototype.hasOwnProperty.call(REGIONS, id)) : (base.localRegions || []);
   out.timeMog = clean(d && d.timeMog, 60) || 'within 24 hours';
   out.timeOther = clean(d && d.timeOther, 60) || '2 to 3 days';
   return out;
@@ -424,15 +428,16 @@ async function handleOrder(req, res, rawItems) {
     merged.set(it.productId, (merged.get(it.productId) || 0) + qty);
   }
   const items = [];
-  let books = 0, booksCents = 0;
+  let books = 0, booksCents = 0, allLocal = true;
   for (const [productId, q] of merged) {
     const qty = Math.min(99, q);
     const priceCents = Math.round(parseFloat(infos.get(productId).price) * 100);
     items.push({ productId, title: infos.get(productId).name, price: priceCents / 100, qty });
     books += qty;
     booksCents += priceCents * qty;
+    if (!(infos.get(productId).stock || DEFAULT_STOCK).includes(regionId)) allLocal = false;
   }
-  const feeCents = deliveryFeeCents(regionId, books);
+  const feeCents = deliveryFeeCents(regionId, books, allLocal);
   const totalCents = booksCents + feeCents;
 
   const orderId = crypto.randomBytes(5).toString('hex').toUpperCase(); // e.g. 3F9A1C7B2E
@@ -621,12 +626,12 @@ app.get('/admin/api/orders', requireAdmin, async (req, res) => {
 
 // ---- Admin: books -------------------------------------------------
 const bookRowToAdmin = r => ({
-  id: r.id, title: r.title, author: r.author, meta: r.meta, category: r.category, price: Number(r.price), rating: r.rating == null ? 4.5 : Number(r.rating),
+  id: r.id, title: r.title, author: r.author, meta: r.meta, category: r.category, price: Number(r.price), rating: r.rating == null ? 4.5 : Number(r.rating), stock: Array.isArray(r.stock) && r.stock.length ? r.stock : DEFAULT_STOCK,
   visible: r.visible, position: r.position, info: r.info || [],
   hasCover: !!r.cover_mime, coverUrl: r.cover_mime ? `/books/${encodeURIComponent(r.id)}/cover?v=${r.cover_v}` : null,
   hasSample: !!r.sample_name, sampleName: r.sample_name, sampleUrl: r.sample_name ? `/books/${encodeURIComponent(r.id)}/sample?v=${r.sample_v}` : null
 });
-const BOOK_COLS = 'id,title,author,meta,category,price,rating,visible,position,info,cover_mime,cover_v,sample_name,sample_v';
+const BOOK_COLS = 'id,title,author,meta,category,price,rating,stock,visible,position,info,cover_mime,cover_v,sample_name,sample_v';
 
 app.get('/admin/api/books', requireAdmin, async (req, res) => {
   try {
@@ -642,8 +647,10 @@ function readBookBody(b, res, isNew) {
   if (price == null || price <= 0) { res.status(400).json({ error: 'Enter a price above 0 (for example 9.50).' }); return null; }
   const rating = Math.round(Number(b.rating) * 10) / 10;
   if (!(rating >= 4 && rating <= 5)) { res.status(400).json({ error: 'The rating must be between 4.0 and 5.0 (for example 4.6).' }); return null; }
+  const stock = (Array.isArray(b.stock) ? [...new Set(b.stock.map(String))] : DEFAULT_STOCK).filter(id => STOCK_REGIONS.includes(id));
+  if (!stock.length) { res.status(400).json({ error: 'Choose where this book is kept: Mogadishu, Somaliland, or both.' }); return null; }
   const out = {
-    title, price, rating,
+    title, price, rating, stock,
     author: clean(b.author, 200), meta: clean(b.meta, 200), category: clean(b.category, 60) || 'Books',
     visible: b.visible !== false,
     info: (Array.isArray(b.info) ? b.info : []).slice(0, 20).map(p => String(p || '').trim().slice(0, 6000)).filter(Boolean)
@@ -671,10 +678,10 @@ app.post('/admin/api/books', requireAdmin, async (req, res) => {
     let base = id, i = 2; while (taken.has(id)) id = `${base}-${i++}`;
     const pos = (await pool.query('SELECT COALESCE(MAX(position),-1)+1 AS p FROM books')).rows[0].p;
     await pool.query(
-      `INSERT INTO books (id,title,author,meta,category,price,visible,position,info,cover,cover_mime,sample,sample_name,rating)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+      `INSERT INTO books (id,title,author,meta,category,price,visible,position,info,cover,cover_mime,sample,sample_name,rating,stock)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
       [id, b.title, b.author, b.meta, b.category, b.price, b.visible, pos, JSON.stringify(b.info),
-       b.cover ? b.cover.buf : null, b.cover ? b.cover.mime : null, b.sample || null, b.sample ? b.sampleName : null, b.rating]);
+       b.cover ? b.cover.buf : null, b.cover ? b.cover.mime : null, b.sample || null, b.sample ? b.sampleName : null, b.rating, JSON.stringify(b.stock)]);
     await refreshCatalog();
     res.json({ id });
   } catch (err) { console.error('admin book create failed:', err.message); res.status(500).json({ error: 'Could not save the book.' }); }
@@ -684,8 +691,8 @@ app.put('/admin/api/books/:id', requireAdmin, async (req, res) => {
   try {
     const b = readBookBody(req.body || {}, res, false);
     if (!b) return;
-    const sets = ['title=$2','author=$3','meta=$4','category=$5','price=$6','visible=$7','info=$8','rating=$9','updated_at=now()'];
-    const vals = [req.params.id, b.title, b.author, b.meta, b.category, b.price, b.visible, JSON.stringify(b.info), b.rating];
+    const sets = ['title=$2','author=$3','meta=$4','category=$5','price=$6','visible=$7','info=$8','rating=$9','stock=$10','updated_at=now()'];
+    const vals = [req.params.id, b.title, b.author, b.meta, b.category, b.price, b.visible, JSON.stringify(b.info), b.rating, JSON.stringify(b.stock)];
     if (b.cover) { vals.push(b.cover.buf, b.cover.mime); sets.push(`cover=$${vals.length - 1}`, `cover_mime=$${vals.length}`, 'cover_v=cover_v+1'); }
     if (b.sample) { vals.push(b.sample, b.sampleName); sets.push(`sample=$${vals.length - 1}`, `sample_name=$${vals.length}`, 'sample_v=sample_v+1'); }
     else if (b.removeSample) { sets.push('sample=NULL', 'sample_name=NULL', 'sample_v=sample_v+1'); }
