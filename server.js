@@ -56,10 +56,11 @@ const REGIONS = {
 
 // Delivery fees. The numbers below are only the defaults: once you save "Delivery fees"
 // in the admin page, the saved values are used instead (for the store AND for charging).
-let deliveryCfg = { benadir1: 1.5, benadir2: 2, other1: 2, other2: 3, other3: 5 };
+// localRegions = the regions where you keep stock: customers there get the fast, cheaper "local" rates (benadir1/benadir2).
+let deliveryCfg = { benadir1: 1.5, benadir2: 2, other1: 2, other2: 3, other3: 5, localRegions: ['benadir', 'somaliland'] };
 function deliveryFeeCents(regionId, books) {
   const d = deliveryCfg;
-  const usd = regionId === 'benadir'
+  const usd = (d.localRegions || []).includes(regionId)
     ? (books <= 1 ? d.benadir1 : d.benadir2)
     : (books <= 1 ? d.other1 : books === 2 ? d.other2 : d.other3);
   return Math.round(usd * 100);
@@ -156,6 +157,7 @@ async function initDb() {
       meta        TEXT NOT NULL DEFAULT '',
       category    TEXT NOT NULL DEFAULT 'Books',
       price       NUMERIC(10,2) NOT NULL,
+      rating      NUMERIC(2,1),
       visible     BOOLEAN NOT NULL DEFAULT TRUE,
       position    INTEGER NOT NULL DEFAULT 0,
       info        JSONB NOT NULL DEFAULT '[]',
@@ -168,7 +170,17 @@ async function initDb() {
       updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     )`);
   await pool.query('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())');
+  await pool.query('ALTER TABLE books ADD COLUMN IF NOT EXISTS rating NUMERIC(2,1)');
   await seedIfEmpty();
+  await pool.query('UPDATE books SET rating = 4.5 WHERE rating IS NULL');   // books without a rating yet
+  // one time: move the three old category names to the new category list
+  const migrated = await pool.query("SELECT 1 FROM settings WHERE key = 'migrated_categories_v1'");
+  if (!migrated.rowCount) {
+    await pool.query("UPDATE books SET category = 'Business & Money' WHERE category = 'Business'");
+    await pool.query("UPDATE books SET category = 'Religion & Spirituality' WHERE category = 'Nonfiction'");
+    await pool.query("UPDATE books SET category = 'Fiction & Novels' WHERE category = 'Fiction'");
+    await pool.query("INSERT INTO settings (key, value) VALUES ('migrated_categories_v1', 'true') ON CONFLICT (key) DO NOTHING");
+  }
   await refreshCatalog();
 }
 
@@ -280,12 +292,16 @@ async function seedIfEmpty() {
     for (const b of seed.books) {
       const cover = parseDataUrl(b.cover, ['image/jpeg', 'image/png', 'image/webp']);
       await pool.query(
-        `INSERT INTO books (id, title, author, meta, category, price, visible, position, info, cover, cover_mime)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
+        `INSERT INTO books (id, title, author, meta, category, price, visible, position, info, cover, cover_mime, rating)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (id) DO NOTHING`,
         [b.id, b.title, b.author || '', b.meta || '', b.category || 'Books', b.price, b.visible !== false,
-         b.position || 0, JSON.stringify(b.info || []), cover ? cover.buf : null, cover ? cover.mime : null]);
+         b.position || 0, JSON.stringify(b.info || []), cover ? cover.buf : null, cover ? cover.mime : null, b.rating || null]);
     }
     console.log(`Seeded ${seed.books.length} books`);
+  }
+  // databases created before ratings existed: give the starter books their starter rating (only where none is set)
+  if (n > 0 && Array.isArray(seed.books)) {
+    for (const b of seed.books) if (b.rating) await pool.query('UPDATE books SET rating=$2 WHERE id=$1 AND rating IS NULL', [b.id, b.rating]);
   }
   for (const key of ['texts', 'delivery']) {
     if (seed[key]) {
@@ -297,7 +313,7 @@ async function seedIfEmpty() {
 function bookRowToPublic(r) {
   return {
     id: r.id, title: r.title, author: r.author, meta: r.meta, category: r.category,
-    price: Number(r.price), info: r.info || [],
+    price: Number(r.price), rating: r.rating == null ? null : Number(r.rating), info: r.info || [],
     cover: r.cover_mime ? `/books/${encodeURIComponent(r.id)}/cover?v=${r.cover_v}` : null,
     sample: r.sample_name ? `/books/${encodeURIComponent(r.id)}/sample?v=${r.sample_v}` : null
   };
@@ -306,7 +322,7 @@ function bookRowToPublic(r) {
 async function refreshCatalog() {
   if (!pool) return;
   const books = await pool.query(
-    `SELECT id,title,author,meta,category,price,info,cover_mime,cover_v,sample_name,sample_v
+    `SELECT id,title,author,meta,category,price,rating,info,cover_mime,cover_v,sample_name,sample_v
        FROM books WHERE visible ORDER BY position, title`);
   const st = await pool.query('SELECT key, value FROM settings');
   const settings = Object.fromEntries(st.rows.map(r => [r.key, r.value]));
@@ -321,6 +337,7 @@ function cleanDelivery(d, base) {
     const v = money2(d && d[k]);
     out[k] = v == null ? base[k] : v;
   }
+  out.localRegions = Array.isArray(d && d.localRegions) ? [...new Set(d.localRegions.map(String))].filter(id => Object.prototype.hasOwnProperty.call(REGIONS, id)) : (base.localRegions || []);
   out.timeMog = clean(d && d.timeMog, 60) || 'within 24 hours';
   out.timeOther = clean(d && d.timeOther, 60) || '2 to 3 days';
   return out;
@@ -604,12 +621,12 @@ app.get('/admin/api/orders', requireAdmin, async (req, res) => {
 
 // ---- Admin: books -------------------------------------------------
 const bookRowToAdmin = r => ({
-  id: r.id, title: r.title, author: r.author, meta: r.meta, category: r.category, price: Number(r.price),
+  id: r.id, title: r.title, author: r.author, meta: r.meta, category: r.category, price: Number(r.price), rating: r.rating == null ? 4.5 : Number(r.rating),
   visible: r.visible, position: r.position, info: r.info || [],
   hasCover: !!r.cover_mime, coverUrl: r.cover_mime ? `/books/${encodeURIComponent(r.id)}/cover?v=${r.cover_v}` : null,
   hasSample: !!r.sample_name, sampleName: r.sample_name, sampleUrl: r.sample_name ? `/books/${encodeURIComponent(r.id)}/sample?v=${r.sample_v}` : null
 });
-const BOOK_COLS = 'id,title,author,meta,category,price,visible,position,info,cover_mime,cover_v,sample_name,sample_v';
+const BOOK_COLS = 'id,title,author,meta,category,price,rating,visible,position,info,cover_mime,cover_v,sample_name,sample_v';
 
 app.get('/admin/api/books', requireAdmin, async (req, res) => {
   try {
@@ -623,8 +640,10 @@ function readBookBody(b, res, isNew) {
   const price = money2(b.price);
   if (!title) { res.status(400).json({ error: 'Enter the book title.' }); return null; }
   if (price == null || price <= 0) { res.status(400).json({ error: 'Enter a price above 0 (for example 9.50).' }); return null; }
+  const rating = Math.round(Number(b.rating) * 10) / 10;
+  if (!(rating >= 4 && rating <= 5)) { res.status(400).json({ error: 'The rating must be between 4.0 and 5.0 (for example 4.6).' }); return null; }
   const out = {
-    title, price,
+    title, price, rating,
     author: clean(b.author, 200), meta: clean(b.meta, 200), category: clean(b.category, 60) || 'Books',
     visible: b.visible !== false,
     info: (Array.isArray(b.info) ? b.info : []).slice(0, 20).map(p => String(p || '').trim().slice(0, 6000)).filter(Boolean)
@@ -652,10 +671,10 @@ app.post('/admin/api/books', requireAdmin, async (req, res) => {
     let base = id, i = 2; while (taken.has(id)) id = `${base}-${i++}`;
     const pos = (await pool.query('SELECT COALESCE(MAX(position),-1)+1 AS p FROM books')).rows[0].p;
     await pool.query(
-      `INSERT INTO books (id,title,author,meta,category,price,visible,position,info,cover,cover_mime,sample,sample_name)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      `INSERT INTO books (id,title,author,meta,category,price,visible,position,info,cover,cover_mime,sample,sample_name,rating)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
       [id, b.title, b.author, b.meta, b.category, b.price, b.visible, pos, JSON.stringify(b.info),
-       b.cover ? b.cover.buf : null, b.cover ? b.cover.mime : null, b.sample || null, b.sample ? b.sampleName : null]);
+       b.cover ? b.cover.buf : null, b.cover ? b.cover.mime : null, b.sample || null, b.sample ? b.sampleName : null, b.rating]);
     await refreshCatalog();
     res.json({ id });
   } catch (err) { console.error('admin book create failed:', err.message); res.status(500).json({ error: 'Could not save the book.' }); }
@@ -665,8 +684,8 @@ app.put('/admin/api/books/:id', requireAdmin, async (req, res) => {
   try {
     const b = readBookBody(req.body || {}, res, false);
     if (!b) return;
-    const sets = ['title=$2','author=$3','meta=$4','category=$5','price=$6','visible=$7','info=$8','updated_at=now()'];
-    const vals = [req.params.id, b.title, b.author, b.meta, b.category, b.price, b.visible, JSON.stringify(b.info)];
+    const sets = ['title=$2','author=$3','meta=$4','category=$5','price=$6','visible=$7','info=$8','rating=$9','updated_at=now()'];
+    const vals = [req.params.id, b.title, b.author, b.meta, b.category, b.price, b.visible, JSON.stringify(b.info), b.rating];
     if (b.cover) { vals.push(b.cover.buf, b.cover.mime); sets.push(`cover=$${vals.length - 1}`, `cover_mime=$${vals.length}`, 'cover_v=cover_v+1'); }
     if (b.sample) { vals.push(b.sample, b.sampleName); sets.push(`sample=$${vals.length - 1}`, `sample_name=$${vals.length}`, 'sample_v=sample_v+1'); }
     else if (b.removeSample) { sets.push('sample=NULL', 'sample_name=NULL', 'sample_v=sample_v+1'); }
