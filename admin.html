@@ -609,7 +609,7 @@
   function openBookEditor(b){
     const isNew = !b;
     const f = { title: b ? b.title : '', author: b ? b.author : '', meta: b ? b.meta : '', category: b ? b.category : 'Business & Money',
-                price: b ? b.price : '', rating: b ? b.rating : 4.6, visible: b ? b.visible : true, info: b ? (b.info || []).join('\n\n') : '', cover:null, sample:null, sampleName:'', removeSample:false };
+                price: b ? b.price : '', rating: b ? b.rating : 4.6, stock: b && b.stock && b.stock.length ? b.stock.slice() : ['benadir','somaliland'], visible: b ? b.visible : true, info: b ? (b.info || []).join('\n\n') : '', cover:null, sample:null, sampleName:'', removeSample:false };
     const cats = CATEGORIES.slice(); if(f.category && !cats.includes(f.category)) cats.push(f.category);
     const msg = h('span', { class:'bad' });
     const prev = h('img', { class:'coverprev', alt:'', src: b && b.coverUrl ? b.coverUrl : '' });
@@ -620,7 +620,7 @@
     const saveBtn = h('button', { class:'btn btn-primary', onclick: async e => {
       msg.textContent = ''; e.target.disabled = true;
       try{
-        const payload = { title:f.title, author:f.author, meta:f.meta, category:f.category, price:f.price, rating:f.rating, visible:f.visible,
+        const payload = { title:f.title, author:f.author, meta:f.meta, category:f.category, price:f.price, rating:f.rating, stock:f.stock, visible:f.visible,
           info: f.info.split(/\n\s*\n/).map(x => x.trim()).filter(Boolean), cover:f.cover || undefined,
           sample:f.sample || undefined, sampleName:f.sampleName || undefined, removeSample:f.removeSample };
         if(isNew) await api('/admin/api/books', { method:'POST', body: JSON.stringify(payload) });
@@ -653,6 +653,11 @@
           try{ f.sample = await fileToDataUrl(file); f.sampleName = file.name.replace(/\.pdf$/i, ''); f.removeSample = false; msg.textContent = ''; sampleNote.textContent = 'Will upload: ' + file.name; } catch(err){ msg.textContent = err.message; }
         } }),
         b && b.hasSample ? h('label', { style:'display:block;margin-top:6px;font-size:0.84rem' }, h('input', { type:'checkbox', onchange: e => { f.removeSample = e.target.checked; } }), ' Remove the current sample') : null),
+      h('div', { class:'fld' }, h('span', {}, 'Where is this book kept? (decides the delivery fee)'),
+        h('div', { style:'display:flex;gap:18px;flex-wrap:wrap' }, [['benadir','Mogadishu'],['somaliland','Somaliland']].map(([id, label]) =>
+          h('label', { style:'display:flex;gap:8px;align-items:center;font-weight:600' },
+            h('input', { type:'checkbox', checked:f.stock.includes(id), onchange: e => { f.stock = e.target.checked ? [...new Set([...f.stock, id])] : f.stock.filter(x => x !== id); } }), label))),
+        h('div', { class:'hint', style:'margin-top:6px' }, 'Tick both if you have copies in both cities. A customer in Mogadishu or Somaliland gets the cheaper 24-hour delivery only when every book in the order is kept in their own city.')),
       h('label', { style:'display:flex;gap:8px;align-items:center;margin:6px 0 14px;font-weight:600' },
         h('input', { type:'checkbox', checked:f.visible, onchange: e => { f.visible = e.target.checked; } }), 'Show this book on the store'),
       h('div', { class:'acts' }, saveBtn, h('button', { class:'btn btn-soft', onclick: closeEditor }, 'Cancel'),
@@ -721,22 +726,17 @@
     );
   }
 
-  const REGION_LIST = [['benadir','Benadir / Mogadishu'],['somaliland','Somaliland'],['puntland','Puntland'],['southwest','Southwest'],['galmudug','Galmudug'],['hirshabelle','Hirshabelle'],['northeastern','Northeastern'],['jubbaland','Jubbaland']];
+  
   function renderDeliveryView(root){
     if(settings == null){ renderTextsView(root); return; }
     const d = settings.delivery;
-    if(!Array.isArray(d.localRegions)) d.localRegions = [];
     const num = (label, key) => h('label', { class:'fld' }, h('span', {}, label), h('input', { type:'number', step:'0.01', min:'0', value:String(d[key]), oninput: e => { d[key] = e.target.value; } }));
     root.append(
       h('p', { class:'upd', style:'margin:0 0 12px' }, 'These fees are used both on the store and when customers are charged, so they always match. Amounts are in US dollars.'),
-      h('div', { class:'sect' }, h('h3', {}, 'Where do you keep stock?'),
-        h('div', { class:'hint' }, 'Customers who choose one of these regions get the fast, cheaper delivery below. Every other region uses the “All other regions” fees.'),
-        h('div', { style:'display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px' }, REGION_LIST.map(([id, label]) =>
-          h('label', { style:'display:flex;gap:8px;align-items:center;font-weight:600' },
-            h('input', { type:'checkbox', checked:d.localRegions.includes(id), onchange: e => { d.localRegions = e.target.checked ? [...new Set([...d.localRegions, id])] : d.localRegions.filter(x => x !== id); } }), label)))),
-      h('div', { class:'sect' }, h('h3', {}, 'Delivery from your stock locations'), h('div', { class:'fgrid' }, num('1 book', 'benadir1'), num('2 or more books', 'benadir2')),
+      h('div', { class:'sect' }, h('h3', {}, 'Same-city delivery (Mogadishu or Somaliland)'),
+        h('div', { class:'hint' }, 'Used when the customer is in Mogadishu or Somaliland AND every book in the order is kept in that same city (set per book under Books).'), h('div', { class:'fgrid' }, num('1 book', 'benadir1'), num('2 or more books', 'benadir2')),
         h('label', { class:'fld' }, h('span', {}, 'Delivery time shown'), h('input', { type:'text', value:d.timeMog, oninput: e => { d.timeMog = e.target.value; } }))),
-      h('div', { class:'sect' }, h('h3', {}, 'All other regions'), h('div', { class:'fgrid' }, num('1 book', 'other1'), num('2 books', 'other2')), h('div', { class:'fgrid' }, num('3 or more books', 'other3'), h('span', {})),
+      h('div', { class:'sect' }, h('h3', {}, 'All other cases'), h('div', { class:'hint' }, 'Other regions, or books kept in the other city (for example Somaliland books to a Mogadishu customer).'), h('div', { class:'fgrid' }, num('1 book', 'other1'), num('2 books', 'other2')), h('div', { class:'fgrid' }, num('3 or more books', 'other3'), h('span', {})),
         h('label', { class:'fld' }, h('span', {}, 'Delivery time shown'), h('input', { type:'text', value:d.timeOther, oninput: e => { d.timeOther = e.target.value; } }))),
       saveBar('Save delivery fees', async () => { await api('/admin/api/settings', { method:'PUT', body: JSON.stringify({ delivery:d }) }); await loadSettings(); })
     );
